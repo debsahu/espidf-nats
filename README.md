@@ -2,6 +2,8 @@
 
 An ESP-IDF and FreeRTOS (probably) compatible C++ library for communicating with a [NATS](http://nats.io) server.
 
+This module is was ported from https://github.com/isobit/arduino-nats and aims to remain compatible with it.
+
 ## Features
 
 - Header-only library
