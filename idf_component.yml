@@ -1,5 +1,6 @@
-version: "1.0.0"
-description: "ESP-IDF NATS client header-only library"
+version: 1.0.0
+description: ESP-IDF NATS client header-only library
+license: MIT
 dependencies:
   idf: ">=4.4"
-type: "header_only"
+url: https://github.com/daed/espidf-nats

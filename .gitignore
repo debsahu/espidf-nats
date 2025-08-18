@@ -39,3 +39,7 @@
 
 # debug information files
 *.dwo
+
+# distribution files
+*.tgz
+dist/
