@@ -13,6 +13,7 @@
 #include <esp_log.h>
 #include <esp_random.h>
 #include <inttypes.h>
+#include <esp_tls.h>
 
 #define NATS_CLIENT_LANG "espidf"
 #define NATS_CLIENT_VERSION "1.0.0"
@@ -164,6 +165,18 @@ namespace NATSUtil {
     };
 };
 
+typedef struct {
+    bool enabled;
+    const char* ca_cert;
+    size_t ca_cert_len;
+    const char* client_cert;
+    size_t client_cert_len;
+    const char* client_key;
+    size_t client_key_len;
+    bool skip_cert_verification;
+    const char* server_name;
+} nats_tls_config_t;
+
 class NATS {
 
     public:
@@ -197,6 +210,8 @@ class NATS {
 
     private:
         int sockfd;
+        esp_tls_t* tls;
+        nats_tls_config_t tls_config;
         const char* hostname;
         const int port;
         const char* user;
@@ -224,8 +239,10 @@ class NATS {
         NATS(const char* hostname,
                 int port = NATS_DEFAULT_PORT,
                 const char* user = NULL,
-                const char* pass = NULL) :
+                const char* pass = NULL,
+                const nats_tls_config_t* tls_cfg = NULL) :
             sockfd(-1),
+            tls(NULL),
             hostname(hostname),
             port(port),
             user(user),
@@ -240,13 +257,25 @@ class NATS {
             on_connect(NULL),
             on_disconnect(NULL),
             on_error(NULL) {
+                if (tls_cfg != NULL) {
+                    tls_config = *tls_cfg;
+                } else {
+                    memset(&tls_config, 0, sizeof(nats_tls_config_t));
+                }
             }
 
     private:
         void send(const char* msg) {
-            if (msg == NULL || sockfd < 0) return;
-            ::send(sockfd, msg, strlen(msg), 0);
-            ::send(sockfd, NATS_CR_LF, strlen(NATS_CR_LF), 0);
+            if (msg == NULL) return;
+            size_t len = strlen(msg);
+            if (tls_config.enabled && tls != NULL) {
+                esp_tls_conn_write(tls, msg, len);
+                esp_tls_conn_write(tls, NATS_CR_LF, strlen(NATS_CR_LF));
+            } else {
+                if (sockfd < 0) return;
+                ::send(sockfd, msg, len, 0);
+                ::send(sockfd, NATS_CR_LF, strlen(NATS_CR_LF), 0);
+            }
         }
 
         int vasprintf(char** strp, const char* fmt, va_list ap) {
@@ -293,7 +322,14 @@ class NATS {
             char* buf = (char*)malloc(cap * sizeof(char));
             int i = 0;
             char c;
-            while (::recv(sockfd, &c, 1, 0) == 1) {
+            int ret;
+            while (true) {
+                if (tls_config.enabled && tls != NULL) {
+                    ret = esp_tls_conn_read(tls, &c, 1);
+                } else {
+                    ret = ::recv(sockfd, &c, 1, 0);
+                }
+                if (ret != 1) break;
                 if (c == '\r') continue;
                 if (c == '\n') break;
                 if (i >= cap) buf = (char*)realloc(buf, (cap *= 2) * sizeof(char) + 1);
@@ -374,28 +410,83 @@ class NATS {
 
     public:
         bool connect() {
-            struct sockaddr_in server_addr;
-            sockfd = socket(AF_INET, SOCK_STREAM, 0);
-            if (sockfd < 0) return false;
-            server_addr.sin_family = AF_INET;
-            server_addr.sin_port = htons(port);
-            server_addr.sin_addr.s_addr = inet_addr(hostname);
-            if (::connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == 0) {
+            if (tls_config.enabled) {
+                // TLS connection
+                esp_tls_cfg_t cfg = {};
+                cfg.cacert_buf = (const unsigned char*)tls_config.ca_cert;
+                cfg.cacert_bytes = tls_config.ca_cert_len;
+
+                if (tls_config.client_cert != NULL && tls_config.client_key != NULL) {
+                    cfg.clientcert_buf = (const unsigned char*)tls_config.client_cert;
+                    cfg.clientcert_bytes = tls_config.client_cert_len;
+                    cfg.clientkey_buf = (const unsigned char*)tls_config.client_key;
+                    cfg.clientkey_bytes = tls_config.client_key_len;
+                }
+
+                if (tls_config.skip_cert_verification) {
+                    cfg.skip_cert_common_name_check = true;
+                }
+
+                if (tls_config.server_name != NULL) {
+                    cfg.common_name = tls_config.server_name;
+                }
+
+                tls = esp_tls_init();
+                if (tls == NULL) {
+                    ESP_LOGE(tag, "Failed to initialize TLS");
+                    reconnect_attempts++;
+                    return false;
+                }
+
+                int ret = esp_tls_conn_new_sync(hostname, strlen(hostname), port, &cfg, tls);
+                if (ret != 1) {
+                    ESP_LOGE(tag, "TLS connection failed: %d", ret);
+                    esp_tls_conn_destroy(tls);
+                    tls = NULL;
+                    reconnect_attempts++;
+                    return false;
+                }
+
+                sockfd = 1; // Set to valid for compatibility with process()
                 outstanding_pings = 0;
                 reconnect_attempts = 0;
                 return true;
+            } else {
+                // Non-TLS connection
+                struct sockaddr_in server_addr;
+                sockfd = socket(AF_INET, SOCK_STREAM, 0);
+                if (sockfd < 0) return false;
+                server_addr.sin_family = AF_INET;
+                server_addr.sin_port = htons(port);
+                server_addr.sin_addr.s_addr = inet_addr(hostname);
+                if (::connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == 0) {
+                    outstanding_pings = 0;
+                    reconnect_attempts = 0;
+                    return true;
+                }
+                close(sockfd);
+                sockfd = -1;
+                reconnect_attempts++;
+                return false;
             }
-            close(sockfd);
-            sockfd = -1;
-            reconnect_attempts++;
-            return false;
         }
 
         void disconnect() {
             if (!connected) return;
             connected = false;
-            if (sockfd >= 0) close(sockfd);
-            sockfd = -1;
+
+            if (tls_config.enabled && tls != NULL) {
+                esp_tls_conn_destroy(tls);
+                tls = NULL;
+            }
+
+            if (sockfd >= 0) {
+                if (!tls_config.enabled) {
+                    close(sockfd);
+                }
+                sockfd = -1;
+            }
+
             subs.empty();
             if (on_disconnect != NULL) on_disconnect();
         }
@@ -472,12 +563,23 @@ class NATS {
                 //ESP_LOGI(tag, "(tick %d) Outstanding pings: %d, Reconnect attempts: %d", log_tick_count, outstanding_pings, reconnect_attempts);
             }
             if (sockfd >= 0) {
+                int fd_to_check = sockfd;
+
+                // For TLS connections, get the underlying socket descriptor
+                if (tls_config.enabled && tls != NULL) {
+                    fd_to_check = esp_tls_get_conn_sockfd(tls);
+                    if (fd_to_check < 0) {
+                        disconnect();
+                        return;
+                    }
+                }
+
                 fd_set rfds;
                 struct timeval tv = {0, 0};
                 FD_ZERO(&rfds);
-                FD_SET(sockfd, &rfds);
-                int ret = select(sockfd + 1, &rfds, NULL, NULL, &tv);
-                if (ret > 0 && FD_ISSET(sockfd, &rfds)) {
+                FD_SET(fd_to_check, &rfds);
+                int ret = select(fd_to_check + 1, &rfds, NULL, NULL, &tv);
+                if (ret > 0 && FD_ISSET(fd_to_check, &rfds)) {
                     recv();
                 }
                 if (ping_timer.process())

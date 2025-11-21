@@ -11,6 +11,7 @@ This module is was ported from https://github.com/isobit/arduino-nats and aims t
 - Familiar C++ object-oriented API, similar usage to the official NATS client
   APIs
 - Automatically attempts to reconnect to NATS server if the connection is dropped
+- **NEW:** TLS/SSL support with server certificate validation and mutual TLS (mTLS)
 
 ### Manual
 
@@ -61,4 +62,68 @@ class NATS {
 
 	void process();			// process pending messages from the buffer, must be called regularly in loop()
 }
+```
+
+## TLS/SSL Usage
+
+To use TLS/SSL encrypted connections, create a `nats_tls_config_t` structure and pass it to the NATS constructor:
+
+```c
+extern const uint8_t ca_cert_pem_start[] asm("_binary_ca_cert_pem_start");
+extern const uint8_t ca_cert_pem_end[] asm("_binary_ca_cert_pem_end");
+
+nats_tls_config_t tls_config = {
+    .enabled = true,
+    .ca_cert = (const char*)ca_cert_pem_start,
+    .ca_cert_len = ca_cert_pem_end - ca_cert_pem_start,
+    .client_cert = NULL,                  // Optional: for mutual TLS
+    .client_cert_len = 0,
+    .client_key = NULL,                   // Optional: for mutual TLS
+    .client_key_len = 0,
+    .skip_cert_verification = false,      // Set true for development only
+    .server_name = "nats.example.com"     // SNI hostname
+};
+
+NATS nats("nats.example.com", 4222, "user", "pass", &tls_config);
+```
+
+### TLS Configuration Options
+
+- **enabled**: Set to `true` to enable TLS/SSL encryption
+- **ca_cert**: PEM-encoded CA certificate for server verification
+- **ca_cert_len**: Length of the CA certificate buffer
+- **client_cert**: PEM-encoded client certificate for mutual TLS (optional)
+- **client_cert_len**: Length of client certificate buffer
+- **client_key**: PEM-encoded private key for mutual TLS (optional)
+- **client_key_len**: Length of private key buffer
+- **skip_cert_verification**: Skip certificate validation (insecure, for development only)
+- **server_name**: Server name for SNI and certificate validation
+
+### Embedding Certificates
+
+To embed certificates in your ESP-IDF project, add them to your `CMakeLists.txt`:
+
+```cmake
+target_add_binary_data(your_target.elf "certs/ca_cert.pem" TEXT)
+target_add_binary_data(your_target.elf "certs/client_cert.pem" TEXT)
+target_add_binary_data(your_target.elf "certs/client_key.pem" TEXT)
+```
+
+### Mutual TLS (mTLS) Example
+
+```c
+nats_tls_config_t tls_config = {
+    .enabled = true,
+    .ca_cert = (const char*)ca_cert_pem_start,
+    .ca_cert_len = ca_cert_pem_end - ca_cert_pem_start,
+    .client_cert = (const char*)client_cert_pem_start,
+    .client_cert_len = client_cert_pem_end - client_cert_pem_start,
+    .client_key = (const char*)client_key_pem_start,
+    .client_key_len = client_key_pem_end - client_key_pem_start,
+    .skip_cert_verification = false,
+    .server_name = "nats.example.com"
+};
+
+// When using mTLS for authentication, user/pass can be NULL
+NATS nats("nats.example.com", 4222, NULL, NULL, &tls_config);
 ```
