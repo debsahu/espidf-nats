@@ -15,6 +15,8 @@
 #include <esp_random.h>
 #include <inttypes.h>
 #include <esp_tls.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #define NATS_CLIENT_LANG "espidf"
 #define NATS_CLIENT_VERSION "1.0.0"
@@ -91,18 +93,36 @@ namespace NATSUtil {
         public:
             Array(size_t cap = 32) : len(0), cap(cap) {
                 data = (T*)malloc(cap * sizeof(T));
+                if (data == NULL) {
+                    ESP_LOGE("Array", "Failed to allocate array");
+                    this->cap = 0;
+                }
             }
             ~Array() { free(data); }
         private:
             void resize() {
                 if (cap == 0) cap = 1;
-                else cap *= 2;
-                data = (T*)realloc(data, cap * sizeof(T));
+                else {
+                    // Check for integer overflow before doubling
+                    if (cap > SIZE_MAX / (2 * sizeof(T))) {
+                        ESP_LOGE("Array", "Array resize would overflow");
+                        return;
+                    }
+                    cap *= 2;
+                }
+                T* new_data = (T*)realloc(data, cap * sizeof(T));
+                if (new_data == NULL) {
+                    ESP_LOGE("Array", "Failed to resize array - out of memory");
+                    cap /= 2;  // Revert cap change
+                    return;
+                }
+                data = new_data;
             }
         public:
             size_t size() const { return len; }
             void erase(size_t idx) {
-                for (size_t i = idx; i < len; i++) {
+                if (idx >= len) return;  // Bounds check
+                for (size_t i = idx; i < len - 1; i++) {  // Fixed: len-1 to avoid overread
                     data[i] = data[i+1];
                 }
                 len--;
@@ -112,6 +132,10 @@ namespace NATSUtil {
                 cap = 32;
                 free(data);
                 data = (T*)malloc(cap * sizeof(T));
+                if (data == NULL) {
+                    ESP_LOGE("Array", "Failed to allocate array in empty()");
+                    cap = 0;
+                }
             }
             T const& operator[](size_t i) const { return data[i]; }
             T& operator[](size_t i) {
@@ -226,6 +250,9 @@ class NATS {
 
         int outstanding_pings;
         int reconnect_attempts;
+        SemaphoreHandle_t io_mutex;       // Protects TLS/socket I/O operations
+        SemaphoreHandle_t subs_mutex;     // Protects subs array and free_sids
+        SemaphoreHandle_t state_mutex;    // Protects outstanding_pings and reconnect_attempts
 
     public:
         bool connected;
@@ -263,41 +290,141 @@ class NATS {
                 } else {
                     memset(&tls_config, 0, sizeof(nats_tls_config_t));
                 }
+                io_mutex = xSemaphoreCreateMutex();
+                if (io_mutex == NULL) {
+                    ESP_LOGE(tag, "Failed to create I/O mutex - out of memory");
+                }
+                subs_mutex = xSemaphoreCreateMutex();
+                if (subs_mutex == NULL) {
+                    ESP_LOGE(tag, "Failed to create subs mutex - out of memory");
+                }
+                state_mutex = xSemaphoreCreateMutex();
+                if (state_mutex == NULL) {
+                    ESP_LOGE(tag, "Failed to create state mutex - out of memory");
+                }
+                if (!validate_tls_config()) {
+                    ESP_LOGE(tag, "Invalid TLS configuration in constructor");
+                }
             }
+
+        ~NATS() {
+            // Clean up subscriptions
+            if (subs_mutex != NULL) xSemaphoreTake(subs_mutex, portMAX_DELAY);
+            for (size_t i = 0; i < subs.size(); i++) {
+                if (subs[i] != NULL) {
+                    delete subs[i];
+                    subs[i] = NULL;
+                }
+            }
+            if (subs_mutex != NULL) xSemaphoreGive(subs_mutex);
+
+            // Close connections
+            if (tls_config.enabled && tls != NULL) {
+                esp_tls_conn_destroy(tls);
+                tls = NULL;
+            }
+            if (sockfd >= 0 && !tls_config.enabled) {
+                close(sockfd);
+                sockfd = -1;
+            }
+
+            // Delete mutexes
+            if (io_mutex != NULL) {
+                vSemaphoreDelete(io_mutex);
+                io_mutex = NULL;
+            }
+            if (subs_mutex != NULL) {
+                vSemaphoreDelete(subs_mutex);
+                subs_mutex = NULL;
+            }
+            if (state_mutex != NULL) {
+                vSemaphoreDelete(state_mutex);
+                state_mutex = NULL;
+            }
+        }
+
+    private:
+        bool validate_tls_config() {
+            if (!tls_config.enabled) {
+                return true;  // No validation needed if TLS is disabled
+            }
+
+            // If TLS is enabled and certificate verification is not skipped, CA cert must be provided
+            if (!tls_config.skip_cert_verification) {
+                if (tls_config.ca_cert == NULL || tls_config.ca_cert_len == 0) {
+                    ESP_LOGE(tag, "TLS enabled with cert verification but no CA certificate provided");
+                    return false;
+                }
+            }
+
+            // If client cert is provided, client key must also be provided (and vice versa)
+            if ((tls_config.client_cert != NULL) != (tls_config.client_key != NULL)) {
+                ESP_LOGE(tag, "TLS client cert and key must both be provided or both be NULL");
+                return false;
+            }
+
+            // If client cert is provided, validate lengths
+            if (tls_config.client_cert != NULL) {
+                if (tls_config.client_cert_len == 0 || tls_config.client_key_len == 0) {
+                    ESP_LOGE(tag, "TLS client cert/key provided but length is zero");
+                    return false;
+                }
+            }
+
+            // Warn if server_name is not set (SNI won't work properly)
+            if (tls_config.server_name == NULL && !tls_config.skip_cert_verification) {
+                ESP_LOGW(tag, "TLS enabled without server_name - SNI will use hostname from connection");
+            }
+
+            return true;
+        }
 
     private:
         void send(const char* msg) {
             if (msg == NULL) return;
             size_t len = strlen(msg);
             ssize_t ret;
+
+            // Protect TLS/socket I/O operations with mutex
+            if (io_mutex != NULL) xSemaphoreTake(io_mutex, portMAX_DELAY);
+
             if (tls_config.enabled && tls != NULL) {
                 ret = esp_tls_conn_write(tls, msg, len);
                 if (ret < 0 || (size_t)ret != len) {
                     ESP_LOGE(tag, "TLS write failed: %d", (int)ret);
+                    if (io_mutex != NULL) xSemaphoreGive(io_mutex);
                     disconnect();
                     return;
                 }
                 ret = esp_tls_conn_write(tls, NATS_CR_LF, strlen(NATS_CR_LF));
                 if (ret < 0) {
                     ESP_LOGE(tag, "TLS write CRLF failed: %d", (int)ret);
+                    if (io_mutex != NULL) xSemaphoreGive(io_mutex);
                     disconnect();
                     return;
                 }
             } else {
-                if (sockfd < 0) return;
+                if (sockfd < 0) {
+                    if (io_mutex != NULL) xSemaphoreGive(io_mutex);
+                    return;
+                }
                 ret = ::send(sockfd, msg, len, 0);
                 if (ret < 0) {
                     ESP_LOGE(tag, "Socket send failed: %d", errno);
+                    if (io_mutex != NULL) xSemaphoreGive(io_mutex);
                     disconnect();
                     return;
                 }
                 ret = ::send(sockfd, NATS_CR_LF, strlen(NATS_CR_LF), 0);
                 if (ret < 0) {
                     ESP_LOGE(tag, "Socket send CRLF failed: %d", errno);
+                    if (io_mutex != NULL) xSemaphoreGive(io_mutex);
                     disconnect();
                     return;
                 }
             }
+
+            if (io_mutex != NULL) xSemaphoreGive(io_mutex);
         }
 
         int vasprintf(char** strp, const char* fmt, va_list ap) {
@@ -309,6 +436,10 @@ class NATS {
             va_end(ap2);
             size += 1;
             *strp = (char*)malloc(size * sizeof(char));
+            if (*strp == NULL) {
+                ESP_LOGE(tag, "Failed to allocate memory in vasprintf");
+                return -1;
+            }
             return vsnprintf(*strp, size, fmt, ap);
         }
 
@@ -316,10 +447,12 @@ class NATS {
             va_list args;
             va_start(args, fmt);
             char* buf;
-            vasprintf(&buf, fmt, args);
+            int ret = vasprintf(&buf, fmt, args);
             va_end(args);
-            send(buf);
-            free(buf);
+            if (ret >= 0) {
+                send(buf);
+                free(buf);
+            }
         }
 
         void send_connect() {
@@ -350,6 +483,10 @@ class NATS {
             int i = 0;
             char c;
             int ret;
+
+            // Protect TLS/socket I/O operations with mutex
+            if (io_mutex != NULL) xSemaphoreTake(io_mutex, portMAX_DELAY);
+
             while (true) {
                 if (tls_config.enabled && tls != NULL) {
                     ret = esp_tls_conn_read(tls, &c, 1);
@@ -361,24 +498,40 @@ class NATS {
                     if (ret < 0) {
                         ESP_LOGE(tag, "Read error: %d", ret);
                     }
+                    if (io_mutex != NULL) xSemaphoreGive(io_mutex);
                     free(buf);
                     disconnect();
                     return (char*)calloc(1, sizeof(char)); // Return empty string
                 }
                 if (c == '\r') continue;
                 if (c == '\n') break;
-                if (i >= cap) {
-                    char* newbuf = (char*)realloc(buf, (cap *= 2) * sizeof(char) + 1);
+                // Check buffer size BEFORE writing to prevent overflow
+                if (i >= cap - 1) {  // Fixed: cap-1 to ensure space for null terminator
+                    size_t new_cap = cap * 2;
+                    // Check for overflow
+                    if (new_cap < cap || new_cap > SIZE_MAX - 1) {
+                        ESP_LOGE(tag, "Buffer size overflow in readline");
+                        if (io_mutex != NULL) xSemaphoreGive(io_mutex);
+                        free(buf);
+                        disconnect();
+                        return (char*)calloc(1, sizeof(char));
+                    }
+                    char* newbuf = (char*)realloc(buf, new_cap * sizeof(char) + 1);
                     if (newbuf == NULL) {
                         ESP_LOGE(tag, "Failed to realloc readline buffer");
+                        if (io_mutex != NULL) xSemaphoreGive(io_mutex);
                         free(buf);
                         disconnect();
                         return (char*)calloc(1, sizeof(char));
                     }
                     buf = newbuf;
+                    cap = new_cap;
                 }
                 buf[i++] = c;
             }
+
+            if (io_mutex != NULL) xSemaphoreGive(io_mutex);
+
             buf[i] = '\0';
             return buf;
         }
@@ -392,11 +545,26 @@ class NATS {
                 if (argv[i] == NULL) break;
                 argc++;
             }
-            if (argc == 0) {}
+            if (argc == 0 || argv[0] == NULL) {
+                free(buf);
+                return;  // Invalid message, nothing to process
+            }
             if (strcmp(argv[0], NATS_CTRL_MSG) == 0) {
                 if (argc != 4 && argc != 5) { free(buf); return; }
                 int sid = atoi(argv[2]);
-                if (subs[sid] == NULL) { free(buf); return; };
+
+                // Protect subs array access with mutex
+                if (subs_mutex != NULL) xSemaphoreTake(subs_mutex, portMAX_DELAY);
+                Sub* sub = (sid < (int)subs.size()) ? subs[sid] : NULL;
+                // Cache whether this will max out BEFORE releasing mutex
+                bool will_max_out = false;
+                if (sub != NULL) {
+                    will_max_out = (sub->max_wanted > 0 && sub->received + 1 >= sub->max_wanted);
+                }
+                if (subs_mutex != NULL) xSemaphoreGive(subs_mutex);
+
+                if (sub == NULL) { free(buf); return; }
+
                 int payload_size = atoi((argc == 5)? argv[4] : argv[3]) + 1;
                 char* payload_buf = client_readline(payload_size);
                 msg e = {
@@ -406,8 +574,14 @@ class NATS {
                     payload_buf,
                     payload_size
                 };
-                subs[sid]->call(e);
-                if (subs[sid]->maxed()) unsubscribe(sid);
+
+                // Call callback WITHOUT holding mutex to prevent deadlock
+                sub->call(e);
+
+                // If maxed out, unsubscribe
+                if (will_max_out) {
+                    unsubscribe(sid);
+                }
                 free(payload_buf);
             }
             else if (strcmp(argv[0], NATS_CTRL_OK) == 0) {
@@ -420,7 +594,9 @@ class NATS {
                 send(NATS_CTRL_PONG);
             }
             else if (strcmp(argv[0], NATS_CTRL_PONG) == 0) {
+                if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
                 outstanding_pings--;
+                if (state_mutex != NULL) xSemaphoreGive(state_mutex);
             }
             else if (strcmp(argv[0], NATS_CTRL_INFO) == 0) {
                 send_connect();
@@ -431,11 +607,19 @@ class NATS {
         }
 
         void ping() {
-            if (outstanding_pings > max_outstanding_pings) {
+            if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
+            int pings = outstanding_pings;
+            if (state_mutex != NULL) xSemaphoreGive(state_mutex);
+
+            if (pings > max_outstanding_pings) {
                 disconnect();
                 return;
             }
+
+            if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
             outstanding_pings++;
+            if (state_mutex != NULL) xSemaphoreGive(state_mutex);
+
             send(NATS_CTRL_PING);
         }
 
@@ -495,7 +679,9 @@ class NATS {
                 tls = esp_tls_init();
                 if (tls == NULL) {
                     ESP_LOGE(tag, "Failed to initialize TLS");
+                    if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
                     reconnect_attempts++;
+                    if (state_mutex != NULL) xSemaphoreGive(state_mutex);
                     return false;
                 }
 
@@ -504,13 +690,17 @@ class NATS {
                     ESP_LOGE(tag, "TLS connection failed: %d", ret);
                     esp_tls_conn_destroy(tls);
                     tls = NULL;
+                    if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
                     reconnect_attempts++;
+                    if (state_mutex != NULL) xSemaphoreGive(state_mutex);
                     return false;
                 }
 
                 sockfd = 1; // Set to valid for compatibility with process()
+                if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
                 outstanding_pings = 0;
                 reconnect_attempts = 0;
+                if (state_mutex != NULL) xSemaphoreGive(state_mutex);
                 return true;
             } else {
                 // Non-TLS connection
@@ -518,7 +708,9 @@ class NATS {
                 sockfd = socket(AF_INET, SOCK_STREAM, 0);
                 if (sockfd < 0) {
                     ESP_LOGE(tag, "Failed to create socket");
+                    if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
                     reconnect_attempts++;
+                    if (state_mutex != NULL) xSemaphoreGive(state_mutex);
                     return false;
                 }
 
@@ -533,22 +725,28 @@ class NATS {
                         ESP_LOGE(tag, "DNS resolution failed for %s", hostname);
                         close(sockfd);
                         sockfd = -1;
+                        if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
                         reconnect_attempts++;
+                        if (state_mutex != NULL) xSemaphoreGive(state_mutex);
                         return false;
                     }
                     memcpy(&server_addr.sin_addr, he->h_addr_list[0], he->h_length);
                 }
 
                 if (::connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == 0) {
+                    if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
                     outstanding_pings = 0;
                     reconnect_attempts = 0;
+                    if (state_mutex != NULL) xSemaphoreGive(state_mutex);
                     return true;
                 }
 
                 ESP_LOGE(tag, "Connection failed to %s:%d", hostname, port);
                 close(sockfd);
                 sockfd = -1;
+                if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
                 reconnect_attempts++;
+                if (state_mutex != NULL) xSemaphoreGive(state_mutex);
                 return false;
             }
         }
@@ -556,6 +754,9 @@ class NATS {
         void disconnect() {
             if (!connected) return;
             connected = false;
+
+            // Hold io_mutex when destroying TLS to prevent race with I/O operations
+            if (io_mutex != NULL) xSemaphoreTake(io_mutex, portMAX_DELAY);
 
             if (tls_config.enabled && tls != NULL) {
                 esp_tls_conn_destroy(tls);
@@ -569,17 +770,30 @@ class NATS {
                 sockfd = -1;
             }
 
+            if (io_mutex != NULL) xSemaphoreGive(io_mutex);
+
+            // Clean up subscriptions with mutex protection
+            if (subs_mutex != NULL) xSemaphoreTake(subs_mutex, portMAX_DELAY);
+            for (size_t i = 0; i < subs.size(); i++) {
+                if (subs[i] != NULL) {
+                    delete subs[i];  // Free Sub objects before clearing array
+                    subs[i] = NULL;
+                }
+            }
             subs.empty();
+            if (subs_mutex != NULL) xSemaphoreGive(subs_mutex);
+
             if (on_disconnect != NULL) on_disconnect();
         }
 
         void publish(const char* subject, const char* msg = NULL, const char* replyto = NULL) {
             if (subject == NULL || subject[0] == 0) return;
             if (!connected) return;
+            size_t msg_len = (msg == NULL) ? 0 : strlen(msg);  // Fixed: NULL check before strlen
             send_fmt("PUB %s %s %lu",
                     subject,
                     (replyto == NULL)? "" : replyto,
-                    (unsigned long)strlen(msg));
+                    (unsigned long)msg_len);
             send((msg == NULL)? "" : msg);
         }
         void publish(const char* subject, const bool msg) {
@@ -589,34 +803,43 @@ class NATS {
             va_list args;
             va_start(args, fmt);
             char* buf;
-            vasprintf(&buf, fmt, args);
+            int ret = vasprintf(&buf, fmt, args);
             va_end(args);
-            publish(subject, buf);
-            free(buf);
+            if (ret >= 0) {
+                publish(subject, buf);
+                free(buf);
+            }
         }
         void publishf(const char* subject, const char* fmt, ...) {
             va_list args;
             va_start(args, fmt);
             char* buf;
-            vasprintf(&buf, fmt, args);
+            int ret = vasprintf(&buf, fmt, args);
             va_end(args);
-            publish(subject, buf);
-            free(buf);
+            if (ret >= 0) {
+                publish(subject, buf);
+                free(buf);
+            }
         }
 
         int subscribe(const char* subject, sub_cb cb, const char* queue = NULL, const int max_wanted = 0) {
             if (!connected) return -1;
             Sub* sub = new Sub(cb, max_wanted);
             int sid;
+
+            // Protect subs array and free_sids with mutex
+            if (subs_mutex != NULL) xSemaphoreTake(subs_mutex, portMAX_DELAY);
             if (free_sids.empty()) {
                 sid = subs.push_back(sub);
             } else {
                 sid = free_sids.pop();
                 subs[sid] = sub;
             }
-            send_fmt("SUB %s %s %d", 
-                    subject, 
-                    (queue == NULL)? "" : queue, 
+            if (subs_mutex != NULL) xSemaphoreGive(subs_mutex);
+
+            send_fmt("SUB %s %s %d",
+                    subject,
+                    (queue == NULL)? "" : queue,
                     sid);
             return sid;
         }
@@ -624,9 +847,15 @@ class NATS {
         void unsubscribe(const int sid) {
             if (!connected) return;
             send_fmt("UNSUB %d", sid);
-            delete subs[sid];  // Use delete for objects created with new
-            subs[sid] = NULL;
-            free_sids.push(sid);
+
+            // Protect subs array and free_sids with mutex
+            if (subs_mutex != NULL) xSemaphoreTake(subs_mutex, portMAX_DELAY);
+            if (sid < (int)subs.size() && subs[sid] != NULL) {
+                delete subs[sid];  // Use delete for objects created with new
+                subs[sid] = NULL;
+                free_sids.push(sid);
+            }
+            if (subs_mutex != NULL) xSemaphoreGive(subs_mutex);
         }
 
         int request(const char* subject, const char* msg, sub_cb cb, const int max_wanted = 1) {
@@ -671,7 +900,12 @@ class NATS {
                     ping();
             } else {
                 disconnect();
-                if (max_reconnect_attempts == -1 || reconnect_attempts < max_reconnect_attempts) {
+                // Protect reconnect_attempts read with mutex
+                if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
+                int attempts = reconnect_attempts;
+                if (state_mutex != NULL) xSemaphoreGive(state_mutex);
+
+                if (max_reconnect_attempts == -1 || attempts < max_reconnect_attempts) {
                     if (reconnect_timer.process())
                         connect();
                 }
