@@ -546,7 +546,7 @@ class NATS {
                 }
 
                 if (tls_config.skip_cert_verification) {
-                    cfg.skip_cert_common_name_check = true;
+                    cfg.skip_common_name = true;
                 }
 
                 if (tls_config.server_name != NULL) {
@@ -874,8 +874,7 @@ class NATS {
                 if (sockfd >= 0) {
                     int fd_to_check = sockfd;
                     if (tls_config.enabled && tls != NULL) {
-                        fd_to_check = esp_tls_get_conn_sockfd(tls);
-                        if (fd_to_check < 0) {
+                        if (esp_tls_get_conn_sockfd(tls, &fd_to_check) != ESP_OK) {
                             return false;
                         }
                     }
@@ -952,8 +951,7 @@ class NATS {
 
                 // For TLS connections, get the underlying socket descriptor
                 if (tls_config.enabled && tls != NULL) {
-                    fd_to_check = esp_tls_get_conn_sockfd(tls);
-                    if (fd_to_check < 0) {
+                    if (esp_tls_get_conn_sockfd(tls, &fd_to_check) != ESP_OK) {
                         disconnect();
                         return;
                     }
