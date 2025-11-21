@@ -201,13 +201,15 @@ class NATS {
             ssize_t ret;
             if (tls_config.enabled && tls != NULL) {
                 ret = esp_tls_conn_write(tls, msg, len);
-                if (ret < 0) {
+                if (ret < 0 || (size_t)ret != len) {
+                    ESP_LOGE(tag, "TLS write failed: %d", (int)ret);
                     last_error_code = NATS_ERR_SOCKET_FAILED;
                     disconnect();
                     return;
                 }
                 ret = esp_tls_conn_write(tls, NATS_CR_LF, strlen(NATS_CR_LF));
                 if (ret < 0) {
+                    ESP_LOGE(tag, "TLS write CRLF failed: %d", (int)ret);
                     last_error_code = NATS_ERR_SOCKET_FAILED;
                     disconnect();
                     return;
@@ -216,12 +218,14 @@ class NATS {
                 if (sockfd < 0) return;
                 ret = ::send(sockfd, msg, len, 0);
                 if (ret < 0) {
+                    ESP_LOGE(tag, "Socket send failed: %d", errno);
                     last_error_code = NATS_ERR_SOCKET_FAILED;
                     disconnect();
                     return;
                 }
                 ret = ::send(sockfd, NATS_CR_LF, strlen(NATS_CR_LF), 0);
                 if (ret < 0) {
+                    ESP_LOGE(tag, "Socket send CRLF failed: %d", errno);
                     last_error_code = NATS_ERR_SOCKET_FAILED;
                     disconnect();
                     return;
@@ -272,6 +276,11 @@ class NATS {
 
         char* client_readline(size_t cap = 128) {
             char* buf = (char*)malloc(cap * sizeof(char));
+            if (buf == NULL) {
+                ESP_LOGE(tag, "Failed to allocate readline buffer");
+                disconnect();
+                return (char*)calloc(1, sizeof(char)); // Return empty string
+            }
             int i = 0;
             char c;
             int ret;
@@ -282,8 +291,9 @@ class NATS {
                     ret = ::recv(sockfd, &c, 1, 0);
                 }
                 if (ret <= 0) {
-                    // Connection error or closed
+                    // Connection closed (0) or error (-1)
                     if (ret < 0) {
+                        ESP_LOGE(tag, "Read error: %d", ret);
                         last_error_code = NATS_ERR_SOCKET_FAILED;
                     }
                     free(buf);
@@ -292,7 +302,16 @@ class NATS {
                 }
                 if (c == '\r') continue;
                 if (c == '\n') break;
-                if (i >= cap) buf = (char*)realloc(buf, (cap *= 2) * sizeof(char) + 1);
+                if (i >= cap) {
+                    char* newbuf = (char*)realloc(buf, (cap *= 2) * sizeof(char) + 1);
+                    if (newbuf == NULL) {
+                        ESP_LOGE(tag, "Failed to realloc readline buffer");
+                        free(buf);
+                        disconnect();
+                        return (char*)calloc(1, sizeof(char));
+                    }
+                    buf = newbuf;
+                }
                 buf[i++] = c;
             }
             buf[i] = '\0';
@@ -458,10 +477,21 @@ class NATS {
         char* generate_inbox_subject() {
             size_t size = strlen(NATS_INBOX_PREFIX) + NATS_INBOX_ID_LENGTH + 1;
             char* buf = (char*)malloc(size);
+            if (buf == NULL) {
+                ESP_LOGE(tag, "Failed to allocate memory for inbox subject");
+                return NULL;
+            }
             strcpy(buf, NATS_INBOX_PREFIX);
             int i;
+            size_t alphanum_len = sizeof(NATSUtil::alphanums) - 1;
             for (i = strlen(NATS_INBOX_PREFIX); i < size - 1; i++) {
-                int random_idx = NATSUtil::random(sizeof(NATSUtil::alphanums) - 1);
+                // Avoid modulo bias by using rejection sampling
+                uint32_t random_val;
+                uint32_t max_valid = (UINT32_MAX / alphanum_len) * alphanum_len;
+                do {
+                    random_val = esp_random();
+                } while (random_val >= max_valid);
+                int random_idx = random_val % alphanum_len;
                 buf[i] = NATSUtil::alphanums[random_idx];
             }
             buf[i] = '\0';
@@ -537,6 +567,8 @@ class NATS {
                 esp_tls_cfg_t cfg = {};
                 cfg.cacert_buf = (const unsigned char*)tls_config.ca_cert;
                 cfg.cacert_bytes = tls_config.ca_cert_len;
+                cfg.timeout_ms = 30000;  // 30 second timeout
+                cfg.non_block = false;    // Use blocking mode for simplicity
 
                 if (tls_config.client_cert != NULL && tls_config.client_key != NULL) {
                     cfg.clientcert_buf = (const unsigned char*)tls_config.client_cert;
@@ -546,7 +578,11 @@ class NATS {
                 }
 
                 if (tls_config.skip_cert_verification) {
+                    // Skip both CN check and server certificate verification
                     cfg.skip_common_name = true;
+                    // Note: esp_tls doesn't have skip_server_cert_verify in older versions
+                    // This only skips CN verification, not the full cert chain
+                    ESP_LOGW(tag, "Certificate CN verification disabled (chain still validated)");
                 }
 
                 if (tls_config.server_name != NULL) {
@@ -780,6 +816,10 @@ class NATS {
             if (subject == NULL || subject[0] == 0) return -1;
             if (!connected) return -1;
             char* inbox = generate_inbox_subject();
+            if (inbox == NULL) {
+                ESP_LOGE(tag, "Failed to generate inbox subject");
+                return -1;
+            }
             int sid = subscribe(inbox, cb, NULL, max_wanted);
             publish(subject, msg, inbox);
             free(inbox);
@@ -790,6 +830,10 @@ class NATS {
             if (subject == NULL || subject[0] == 0) return -1;
             if (!connected) return -1;
             char* inbox = generate_inbox_subject();
+            if (inbox == NULL) {
+                ESP_LOGE(tag, "Failed to generate inbox subject");
+                return -1;
+            }
 
             xSemaphoreTake(mutex, portMAX_DELAY);
             Sub* sub = new Sub(cb, max_wanted, timeout_ms, on_timeout);
