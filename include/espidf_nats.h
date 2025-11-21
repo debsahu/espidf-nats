@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <unistd.h>
 #include <esp_log.h>
 #include <esp_random.h>
@@ -31,7 +32,15 @@
 #endif
 
 #ifndef NATS_RECONNECT_INTERVAL
-#define NATS_RECONNECT_INTERVAL 5000UL
+#define NATS_RECONNECT_INTERVAL 1000UL
+#endif
+
+#ifndef NATS_MAX_RECONNECT_DELAY
+#define NATS_MAX_RECONNECT_DELAY 30000UL
+#endif
+
+#ifndef NATS_MAX_PENDING_MESSAGES
+#define NATS_MAX_PENDING_MESSAGES 100
 #endif
 
 #define NATS_DEFAULT_PORT 4222
@@ -43,6 +52,7 @@
 
 #define NATS_CR_LF "\r\n"
 #define NATS_CTRL_MSG "MSG"
+#define NATS_CTRL_HMSG "HMSG"
 #define NATS_CTRL_OK "+OK"
 #define NATS_CTRL_ERR "-ERR"
 #define NATS_CTRL_PING "PING"
@@ -177,6 +187,35 @@ typedef struct {
     const char* server_name;
 } nats_tls_config_t;
 
+typedef struct {
+    const char* hostname;
+    int port;
+} nats_server_t;
+
+typedef struct {
+    uint64_t msgs_sent;
+    uint64_t msgs_received;
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
+    uint32_t reconnections;
+    unsigned long last_connect_time;
+    unsigned long uptime;
+} nats_connection_metrics_t;
+
+typedef enum {
+    NATS_ERR_NONE = 0,
+    NATS_ERR_CONNECTION_FAILED,
+    NATS_ERR_DNS_RESOLUTION_FAILED,
+    NATS_ERR_TLS_INIT_FAILED,
+    NATS_ERR_TLS_CONNECTION_FAILED,
+    NATS_ERR_SOCKET_FAILED,
+    NATS_ERR_PROTOCOL_ERROR,
+    NATS_ERR_MAX_PINGS_EXCEEDED,
+    NATS_ERR_DISCONNECTED,
+    NATS_ERR_INVALID_SUBJECT,
+    NATS_ERR_NOT_CONNECTED
+} nats_error_code_t;
+
 class NATS {
 
     public:
@@ -184,21 +223,41 @@ class NATS {
             const char* subject;
             const int sid;
             const char* reply;
+            const char* headers;
+            const int header_size;
             const char* data;
             const int size;
         } msg;
 
     private:
+        typedef struct {
+            char* subject;
+            char* message;
+            char* reply_to;
+            char* headers;
+        } pending_msg_t;
         typedef void (*sub_cb)(msg e);
         typedef void (*event_cb)();
+        typedef void (*timeout_cb)();
+        typedef void (*connect_cb)(bool success);
+
+        enum ConnectState {
+            DISCONNECTED,
+            CONNECTING,
+            CONNECTED
+        };
 
         class Sub {
             public:
             sub_cb cb;
             int received;
             int max_wanted;
-            Sub(sub_cb cb, int max_wanted = 0) :
-                cb(cb), received(0), max_wanted(max_wanted) {}
+            unsigned long timeout_ms;
+            unsigned long request_time;
+            timeout_cb on_timeout;
+            Sub(sub_cb cb, int max_wanted = 0, unsigned long timeout_ms = 0, timeout_cb on_timeout = NULL) :
+                cb(cb), received(0), max_wanted(max_wanted),
+                timeout_ms(timeout_ms), request_time(NATSUtil::millis()), on_timeout(on_timeout) {}
             void call(msg& e) {
                 received++;
                 cb(e);
@@ -206,36 +265,53 @@ class NATS {
             bool maxed() {
                 return (max_wanted == 0)? false : received >= max_wanted;
             }
+            bool timed_out() {
+                if (timeout_ms == 0) return false;
+                return (NATSUtil::millis() - request_time) > timeout_ms;
+            }
         };
 
     private:
         int sockfd;
         esp_tls_t* tls;
         nats_tls_config_t tls_config;
-        const char* hostname;
-        const int port;
+        NATSUtil::Array<nats_server_t> servers;
+        size_t current_server_idx;
         const char* user;
         const char* pass;
 
         NATSUtil::Array<Sub*> subs;
         NATSUtil::Queue<size_t> free_sids;
+        NATSUtil::Queue<pending_msg_t> pending_messages;
 
         NATSUtil::MillisTimer ping_timer;
         NATSUtil::MillisTimer reconnect_timer;
 
         int outstanding_pings;
         int reconnect_attempts;
+        unsigned long last_reconnect_attempt;
+
+        ConnectState connect_state;
+        connect_cb async_connect_cb;
+
+        nats_connection_metrics_t metrics;
+        nats_error_code_t last_error_code;
+        bool draining;
 
     public:
         bool connected;
         int max_outstanding_pings;
         int max_reconnect_attempts;
+        bool exponential_backoff_enabled;
+        bool message_buffering_enabled;
+        size_t max_pending_messages;
 
         event_cb on_connect;
         event_cb on_disconnect;
         event_cb on_error;
 
     public:
+        // Single server constructor
         NATS(const char* hostname,
                 int port = NATS_DEFAULT_PORT,
                 const char* user = NULL,
@@ -243,25 +319,79 @@ class NATS {
                 const nats_tls_config_t* tls_cfg = NULL) :
             sockfd(-1),
             tls(NULL),
-            hostname(hostname),
-            port(port),
+            current_server_idx(0),
             user(user),
             pass(pass),
             ping_timer(NATS_PING_INTERVAL),
             reconnect_timer(NATS_RECONNECT_INTERVAL),
             outstanding_pings(0),
             reconnect_attempts(0),
+            last_reconnect_attempt(0),
+            connect_state(DISCONNECTED),
+            async_connect_cb(NULL),
             connected(false),
             max_outstanding_pings(3),
             max_reconnect_attempts(-1),
+            exponential_backoff_enabled(true),
+            message_buffering_enabled(true),
+            max_pending_messages(NATS_MAX_PENDING_MESSAGES),
             on_connect(NULL),
             on_disconnect(NULL),
             on_error(NULL) {
+                nats_server_t server = {hostname, port};
+                servers.push_back(server);
                 if (tls_cfg != NULL) {
                     tls_config = *tls_cfg;
                 } else {
                     memset(&tls_config, 0, sizeof(nats_tls_config_t));
                 }
+                memset(&metrics, 0, sizeof(nats_connection_metrics_t));
+                last_error_code = NATS_ERR_NONE;
+                draining = false;
+            }
+
+        // Multiple servers constructor with failover
+        NATS(const nats_server_t* server_list,
+                size_t server_count,
+                const char* user = NULL,
+                const char* pass = NULL,
+                const nats_tls_config_t* tls_cfg = NULL) :
+            sockfd(-1),
+            tls(NULL),
+            current_server_idx(0),
+            user(user),
+            pass(pass),
+            ping_timer(NATS_PING_INTERVAL),
+            reconnect_timer(NATS_RECONNECT_INTERVAL),
+            outstanding_pings(0),
+            reconnect_attempts(0),
+            last_reconnect_attempt(0),
+            connect_state(DISCONNECTED),
+            async_connect_cb(NULL),
+            connected(false),
+            max_outstanding_pings(3),
+            max_reconnect_attempts(-1),
+            exponential_backoff_enabled(true),
+            message_buffering_enabled(true),
+            max_pending_messages(NATS_MAX_PENDING_MESSAGES),
+            on_connect(NULL),
+            on_disconnect(NULL),
+            on_error(NULL) {
+                for (size_t i = 0; i < server_count; i++) {
+                    servers.push_back(server_list[i]);
+                }
+                // Randomize initial server selection for load distribution
+                if (server_count > 1) {
+                    current_server_idx = NATSUtil::random(server_count);
+                }
+                if (tls_cfg != NULL) {
+                    tls_config = *tls_cfg;
+                } else {
+                    memset(&tls_config, 0, sizeof(nats_tls_config_t));
+                }
+                memset(&metrics, 0, sizeof(nats_connection_metrics_t));
+                last_error_code = NATS_ERR_NONE;
+                draining = false;
             }
 
     private:
@@ -276,6 +406,7 @@ class NATS {
                 ::send(sockfd, msg, len, 0);
                 ::send(sockfd, NATS_CR_LF, strlen(NATS_CR_LF), 0);
             }
+            metrics.bytes_sent += len + strlen(NATS_CR_LF);
         }
 
         int vasprintf(char** strp, const char* fmt, va_list ap) {
@@ -359,16 +490,50 @@ class NATS {
                     argv[1],
                     sid,
                     (argc == 5)? argv[3] : "",
+                    NULL,
+                    0,
                     payload_buf,
                     payload_size
                 };
+                metrics.msgs_received++;
+                metrics.bytes_received += payload_size;
                 subs[sid]->call(e);
                 if (subs[sid]->maxed()) unsubscribe(sid);
                 free(payload_buf);
             }
+            else if (strcmp(argv[0], NATS_CTRL_HMSG) == 0) {
+                // HMSG <subject> <sid> [reply-to] <header bytes> <total bytes>
+                if (argc != 5 && argc != 6) { free(buf); return; }
+                int sid = atoi(argv[2]);
+                if (subs[sid] == NULL) { free(buf); return; };
+
+                int header_size = atoi((argc == 6)? argv[4] : argv[3]);
+                int total_size = atoi((argc == 6)? argv[5] : argv[4]) + 1;
+                int data_size = total_size - header_size;
+
+                char* full_buf = client_readline(total_size);
+                char* header_buf = full_buf;
+                char* data_buf = full_buf + header_size;
+
+                msg e = {
+                    argv[1],
+                    sid,
+                    (argc == 6)? argv[3] : "",
+                    header_buf,
+                    header_size,
+                    data_buf,
+                    data_size
+                };
+                metrics.msgs_received++;
+                metrics.bytes_received += total_size;
+                subs[sid]->call(e);
+                if (subs[sid]->maxed()) unsubscribe(sid);
+                free(full_buf);
+            }
             else if (strcmp(argv[0], NATS_CTRL_OK) == 0) {
             }
             else if (strcmp(argv[0], NATS_CTRL_ERR) == 0) {
+                last_error_code = NATS_ERR_PROTOCOL_ERROR;
                 if (on_error != NULL) on_error();
                 disconnect();
             }
@@ -382,12 +547,15 @@ class NATS {
                 send_connect();
                 connected = true;
                 if (on_connect != NULL) on_connect();
+                // Send any pending messages that were buffered while offline
+                send_pending_messages();
             }
             free(buf);
         }
 
         void ping() {
             if (outstanding_pings > max_outstanding_pings) {
+                last_error_code = NATS_ERR_MAX_PINGS_EXCEEDED;
                 disconnect();
                 return;
             }
@@ -408,8 +576,52 @@ class NATS {
             return buf;
         }
 
-    public:
-        bool connect() {
+        unsigned long get_reconnect_delay() {
+            if (!exponential_backoff_enabled) {
+                return NATS_RECONNECT_INTERVAL;
+            }
+
+            // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (max)
+            unsigned long delay = NATS_RECONNECT_INTERVAL * (1 << reconnect_attempts);
+            if (delay > NATS_MAX_RECONNECT_DELAY) {
+                delay = NATS_MAX_RECONNECT_DELAY;
+            }
+            return delay;
+        }
+
+        void buffer_message(const char* subject, const char* msg, const char* replyto, const char* headers) {
+            if (!message_buffering_enabled) return;
+            if (pending_messages.size() >= max_pending_messages) return;
+
+            pending_msg_t pmsg;
+            pmsg.subject = (subject != NULL) ? strdup(subject) : NULL;
+            pmsg.message = (msg != NULL) ? strdup(msg) : NULL;
+            pmsg.reply_to = (replyto != NULL) ? strdup(replyto) : NULL;
+            pmsg.headers = (headers != NULL) ? strdup(headers) : NULL;
+
+            pending_messages.push(pmsg);
+        }
+
+        void send_pending_messages() {
+            while (!pending_messages.empty()) {
+                pending_msg_t pmsg = pending_messages.pop();
+
+                if (pmsg.headers != NULL) {
+                    publish_with_headers(pmsg.subject, pmsg.headers, pmsg.message, pmsg.reply_to);
+                } else {
+                    publish(pmsg.subject, pmsg.message, pmsg.reply_to);
+                }
+
+                // Free allocated memory
+                if (pmsg.subject != NULL) free(pmsg.subject);
+                if (pmsg.message != NULL) free(pmsg.message);
+                if (pmsg.reply_to != NULL) free(pmsg.reply_to);
+                if (pmsg.headers != NULL) free(pmsg.headers);
+            }
+        }
+
+    private:
+        bool try_connect_to_server(const nats_server_t& server) {
             if (tls_config.enabled) {
                 // TLS connection
                 esp_tls_cfg_t cfg = {};
@@ -434,46 +646,110 @@ class NATS {
                 tls = esp_tls_init();
                 if (tls == NULL) {
                     ESP_LOGE(tag, "Failed to initialize TLS");
-                    reconnect_attempts++;
+                    last_error_code = NATS_ERR_TLS_INIT_FAILED;
                     return false;
                 }
 
-                int ret = esp_tls_conn_new_sync(hostname, strlen(hostname), port, &cfg, tls);
+                int ret = esp_tls_conn_new_sync(server.hostname, strlen(server.hostname), server.port, &cfg, tls);
                 if (ret != 1) {
-                    ESP_LOGE(tag, "TLS connection failed: %d", ret);
+                    ESP_LOGE(tag, "TLS connection failed to %s:%d: %d", server.hostname, server.port, ret);
                     esp_tls_conn_destroy(tls);
                     tls = NULL;
-                    reconnect_attempts++;
+                    last_error_code = NATS_ERR_TLS_CONNECTION_FAILED;
                     return false;
                 }
 
                 sockfd = 1; // Set to valid for compatibility with process()
-                outstanding_pings = 0;
-                reconnect_attempts = 0;
                 return true;
             } else {
-                // Non-TLS connection
-                struct sockaddr_in server_addr;
-                sockfd = socket(AF_INET, SOCK_STREAM, 0);
-                if (sockfd < 0) return false;
-                server_addr.sin_family = AF_INET;
-                server_addr.sin_port = htons(port);
-                server_addr.sin_addr.s_addr = inet_addr(hostname);
-                if (::connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == 0) {
-                    outstanding_pings = 0;
-                    reconnect_attempts = 0;
-                    return true;
+                // Non-TLS connection with DNS resolution
+                struct addrinfo hints = {};
+                struct addrinfo *result, *rp;
+                char port_str[6];
+                snprintf(port_str, sizeof(port_str), "%d", server.port);
+
+                hints.ai_family = AF_UNSPEC;    // Allow IPv4 or IPv6
+                hints.ai_socktype = SOCK_STREAM;
+                hints.ai_protocol = IPPROTO_TCP;
+
+                int ret = getaddrinfo(server.hostname, port_str, &hints, &result);
+                if (ret != 0) {
+                    ESP_LOGE(tag, "DNS resolution failed for %s: %d", server.hostname, ret);
+                    last_error_code = NATS_ERR_DNS_RESOLUTION_FAILED;
+                    return false;
                 }
-                close(sockfd);
-                sockfd = -1;
-                reconnect_attempts++;
+
+                // Try each address until we successfully connect
+                for (rp = result; rp != NULL; rp = rp->ai_next) {
+                    sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+                    if (sockfd < 0) continue;
+
+                    if (::connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0) {
+                        // Connection successful
+                        freeaddrinfo(result);
+                        last_error_code = NATS_ERR_NONE;
+                        return true;
+                    }
+
+                    close(sockfd);
+                    sockfd = -1;
+                }
+
+                // All addresses failed
+                freeaddrinfo(result);
+                last_error_code = NATS_ERR_CONNECTION_FAILED;
                 return false;
             }
+        }
+
+    public:
+        bool connect() {
+            // Try connecting to all servers in the list
+            size_t start_idx = current_server_idx;
+            do {
+                ESP_LOGI(tag, "Attempting to connect to %s:%d",
+                    servers[current_server_idx].hostname,
+                    servers[current_server_idx].port);
+
+                if (try_connect_to_server(servers[current_server_idx])) {
+                    outstanding_pings = 0;
+                    reconnect_attempts = 0;
+                    connect_state = CONNECTING;
+                    metrics.last_connect_time = NATSUtil::millis();
+                    if (metrics.reconnections > 0 || connected) {
+                        metrics.reconnections++;
+                    }
+                    ESP_LOGI(tag, "Connected to %s:%d",
+                        servers[current_server_idx].hostname,
+                        servers[current_server_idx].port);
+                    return true;
+                }
+
+                // Move to next server
+                current_server_idx = (current_server_idx + 1) % servers.size();
+            } while (current_server_idx != start_idx);
+
+            // All servers failed
+            reconnect_attempts++;
+            connect_state = DISCONNECTED;
+            return false;
+        }
+
+        void connect_async(connect_cb callback) {
+            async_connect_cb = callback;
+            connect_state = CONNECTING;
+            // Connection will be attempted in process()
         }
 
         void disconnect() {
             if (!connected) return;
             connected = false;
+            connect_state = DISCONNECTED;
+            async_connect_cb = NULL;
+
+            if (last_error_code == NATS_ERR_NONE) {
+                last_error_code = NATS_ERR_DISCONNECTED;
+            }
 
             if (tls_config.enabled && tls != NULL) {
                 esp_tls_conn_destroy(tls);
@@ -493,15 +769,38 @@ class NATS {
 
         void publish(const char* subject, const char* msg = NULL, const char* replyto = NULL) {
             if (subject == NULL || subject[0] == 0) return;
-            if (!connected) return;
+            if (!connected) {
+                buffer_message(subject, msg, replyto, NULL);
+                return;
+            }
             send_fmt("PUB %s %s %lu",
                     subject,
                     (replyto == NULL)? "" : replyto,
                     (unsigned long)strlen(msg));
             send((msg == NULL)? "" : msg);
+            metrics.msgs_sent++;
         }
         void publish(const char* subject, const bool msg) {
             publish(subject, (msg)? "true" : "false");
+        }
+        void publish_with_headers(const char* subject, const char* headers, const char* msg = NULL, const char* replyto = NULL) {
+            if (subject == NULL || subject[0] == 0) return;
+            if (!connected) {
+                buffer_message(subject, msg, replyto, headers);
+                return;
+            }
+            size_t header_len = (headers == NULL) ? 0 : strlen(headers);
+            size_t msg_len = (msg == NULL) ? 0 : strlen(msg);
+            size_t total_len = header_len + msg_len;
+
+            send_fmt("HPUB %s %s %lu %lu",
+                    subject,
+                    (replyto == NULL)? "" : replyto,
+                    (unsigned long)header_len,
+                    (unsigned long)total_len);
+            if (headers != NULL) send(headers);
+            if (msg != NULL) send(msg);
+            metrics.msgs_sent++;
         }
         void publish_fmt(const char* subject, const char* fmt, ...) {
             va_list args;
@@ -557,11 +856,163 @@ class NATS {
             return sid;
         }
 
+        int request_with_timeout(const char* subject, const char* msg, sub_cb cb, unsigned long timeout_ms, timeout_cb on_timeout = NULL, const int max_wanted = 1) {
+            if (subject == NULL || subject[0] == 0) return -1;
+            if (!connected) return -1;
+            char* inbox = generate_inbox_subject();
+
+            Sub* sub = new Sub(cb, max_wanted, timeout_ms, on_timeout);
+            int sid;
+            if (free_sids.empty()) {
+                sid = subs.push_back(sub);
+            } else {
+                sid = free_sids.pop();
+                subs[sid] = sub;
+            }
+            send_fmt("SUB %s %d", inbox, sid);
+
+            publish(subject, msg, inbox);
+            free(inbox);
+            return sid;
+        }
+
+        // Basic JetStream publish with ACK
+        int jetstream_publish(const char* subject, const char* msg, sub_cb ack_cb, timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
+            if (subject == NULL || subject[0] == 0) return -1;
+            if (!connected) return -1;
+
+            // Build JetStream API subject: $JS.API.PUBLISH.<subject>
+            size_t api_subject_len = strlen("$JS.API.PUBLISH.") + strlen(subject) + 1;
+            char* api_subject = (char*)malloc(api_subject_len);
+            snprintf(api_subject, api_subject_len, "$JS.API.PUBLISH.%s", subject);
+
+            int sid = request_with_timeout(api_subject, msg, ack_cb, timeout_ms, on_timeout, 1);
+
+            free(api_subject);
+            return sid;
+        }
+
+        nats_connection_metrics_t get_metrics() {
+            nats_connection_metrics_t current_metrics = metrics;
+            if (connected && metrics.last_connect_time > 0) {
+                current_metrics.uptime = NATSUtil::millis() - metrics.last_connect_time;
+            }
+            return current_metrics;
+        }
+
+        nats_error_code_t last_error() const {
+            return last_error_code;
+        }
+
+        const char* error_string(nats_error_code_t err) const {
+            switch (err) {
+                case NATS_ERR_NONE: return "No error";
+                case NATS_ERR_CONNECTION_FAILED: return "Connection failed";
+                case NATS_ERR_DNS_RESOLUTION_FAILED: return "DNS resolution failed";
+                case NATS_ERR_TLS_INIT_FAILED: return "TLS initialization failed";
+                case NATS_ERR_TLS_CONNECTION_FAILED: return "TLS connection failed";
+                case NATS_ERR_SOCKET_FAILED: return "Socket operation failed";
+                case NATS_ERR_PROTOCOL_ERROR: return "Protocol error";
+                case NATS_ERR_MAX_PINGS_EXCEEDED: return "Maximum outstanding pings exceeded";
+                case NATS_ERR_DISCONNECTED: return "Disconnected";
+                case NATS_ERR_INVALID_SUBJECT: return "Invalid subject";
+                case NATS_ERR_NOT_CONNECTED: return "Not connected";
+                default: return "Unknown error";
+            }
+        }
+
+        const char* last_error_string() const {
+            return error_string(last_error_code);
+        }
+
+        bool flush(unsigned long timeout_ms = 5000) {
+            if (!connected) {
+                last_error_code = NATS_ERR_NOT_CONNECTED;
+                return false;
+            }
+
+            // Send PING and wait for PONG
+            int initial_pongs = outstanding_pings;
+            send(NATS_CTRL_PING);
+            outstanding_pings++;
+
+            unsigned long start_time = NATSUtil::millis();
+            while ((NATSUtil::millis() - start_time) < timeout_ms) {
+                // Process incoming messages
+                if (sockfd >= 0) {
+                    int fd_to_check = sockfd;
+                    if (tls_config.enabled && tls != NULL) {
+                        fd_to_check = esp_tls_get_conn_sockfd(tls);
+                        if (fd_to_check < 0) {
+                            return false;
+                        }
+                    }
+
+                    fd_set rfds;
+                    struct timeval tv = {0, 10000}; // 10ms timeout
+                    FD_ZERO(&rfds);
+                    FD_SET(fd_to_check, &rfds);
+                    int ret = select(fd_to_check + 1, &rfds, NULL, NULL, &tv);
+                    if (ret > 0 && FD_ISSET(fd_to_check, &rfds)) {
+                        recv();
+                        // Check if we got the PONG
+                        if (outstanding_pings <= initial_pongs) {
+                            return true;
+                        }
+                    }
+                }
+
+                if (!connected) {
+                    return false;
+                }
+            }
+
+            // Timeout
+            return false;
+        }
+
+        void drain(unsigned long timeout_ms = 5000) {
+            if (!connected) return;
+
+            draining = true;
+
+            // Unsubscribe from all subscriptions
+            for (size_t i = 0; i < subs.size(); i++) {
+                if (subs[i] != NULL) {
+                    send_fmt("UNSUB %d", i);
+                    free(subs[i]);
+                    subs[i] = NULL;
+                    free_sids.push(i);
+                }
+            }
+
+            // Flush to ensure all unsubscribes are sent
+            flush(timeout_ms);
+
+            // Disconnect
+            disconnect();
+            draining = false;
+        }
+
         int log_tick_count = 0;
         void process() {
             if (log_tick_count++ % 1000 == 0) {
                 //ESP_LOGI(tag, "(tick %d) Outstanding pings: %d, Reconnect attempts: %d", log_tick_count, outstanding_pings, reconnect_attempts);
             }
+
+            // Handle async connect
+            if (connect_state == CONNECTING && async_connect_cb != NULL && sockfd < 0) {
+                bool success = connect();
+                if (success) {
+                    connect_state = CONNECTED;
+                } else {
+                    connect_state = DISCONNECTED;
+                }
+                async_connect_cb(success);
+                async_connect_cb = NULL;
+                return;
+            }
+
             if (sockfd >= 0) {
                 int fd_to_check = sockfd;
 
@@ -582,13 +1033,30 @@ class NATS {
                 if (ret > 0 && FD_ISSET(fd_to_check, &rfds)) {
                     recv();
                 }
+
+                // Check for request timeouts
+                for (size_t i = 0; i < subs.size(); i++) {
+                    if (subs[i] != NULL && subs[i]->timed_out()) {
+                        if (subs[i]->on_timeout != NULL) {
+                            subs[i]->on_timeout();
+                        }
+                        unsubscribe(i);
+                    }
+                }
+
                 if (ping_timer.process())
                     ping();
             } else {
                 disconnect();
                 if (max_reconnect_attempts == -1 || reconnect_attempts < max_reconnect_attempts) {
-                    if (reconnect_timer.process())
+                    unsigned long current_time = NATSUtil::millis();
+                    unsigned long reconnect_delay = get_reconnect_delay();
+
+                    // Check if enough time has passed for the next reconnect attempt
+                    if (current_time - last_reconnect_attempt >= reconnect_delay) {
+                        last_reconnect_attempt = current_time;
                         connect();
+                    }
                 }
             }
         }

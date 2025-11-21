@@ -11,7 +11,18 @@ This module is was ported from https://github.com/isobit/arduino-nats and aims t
 - Familiar C++ object-oriented API, similar usage to the official NATS client
   APIs
 - Automatically attempts to reconnect to NATS server if the connection is dropped
-- **NEW:** TLS/SSL support with server certificate validation and mutual TLS (mTLS)
+- **TLS/SSL support** with server certificate validation and mutual TLS (mTLS)
+- **DNS resolution** - Connect using hostnames, not just IP addresses
+- **Multiple server URLs with automatic failover** - High availability support
+- **NATS 2.0 Headers** - Publish and receive messages with headers (HPUB/HMSG)
+- **Request timeouts** - Prevent hanging requests with configurable timeouts
+- **Async/non-blocking API** - connect_async() for better FreeRTOS integration
+- **Basic JetStream support** - Publish with acknowledgment for guaranteed delivery
+- **Connection metrics** - Track messages/bytes sent/received, reconnections, and uptime
+- **Error handling** - Detailed error codes with last_error() for diagnostics
+- **Message buffering** - Automatic offline message queuing and replay on reconnect
+- **Exponential backoff** - Smart reconnection delays (1s, 2s, 4s, 8s, 16s, 30s max)
+- **Flush and drain** - Graceful shutdown with pending message delivery guarantees
 
 ### Manual
 
@@ -126,4 +137,216 @@ nats_tls_config_t tls_config = {
 
 // When using mTLS for authentication, user/pass can be NULL
 NATS nats("nats.example.com", 4222, NULL, NULL, &tls_config);
+```
+
+## Advanced Features
+
+### Multiple Servers with Automatic Failover
+
+Connect to a NATS cluster with automatic failover between nodes:
+
+```c
+nats_server_t servers[] = {
+    {"nats1.example.com", 4222},
+    {"nats2.example.com", 4222},
+    {"nats3.example.com", 4222}
+};
+
+NATS nats(servers, 3, "user", "pass", &tls_config);
+```
+
+The library will automatically try all servers in the list and fail over to the next server if the current connection is lost.
+
+### NATS Headers (NATS 2.0+)
+
+Publish and subscribe to messages with headers:
+
+```c
+// Publish with headers
+const char* headers = "Content-Type: application/json\r\nPriority: high\r\n\r\n";
+nats.publish_with_headers("orders", headers, "{\"id\":123}");
+
+// Subscribe - headers are available in the msg struct
+nats.subscribe("orders", [](NATS::msg e) {
+    if (e.headers != NULL) {
+        ESP_LOGI(TAG, "Headers: %.*s", e.header_size, e.headers);
+    }
+    ESP_LOGI(TAG, "Data: %.*s", e.size, e.data);
+});
+```
+
+### Request with Timeout
+
+Prevent hanging requests by specifying a timeout:
+
+```c
+nats.request_with_timeout(
+    "service.ping",                    // subject
+    "PING",                            // request data
+    [](NATS::msg e) {                  // response callback
+        ESP_LOGI(TAG, "Got response: %s", e.data);
+    },
+    5000,                              // 5 second timeout
+    []() {                             // timeout callback
+        ESP_LOGW(TAG, "Request timed out!");
+    }
+);
+```
+
+### Async/Non-blocking Connection
+
+Use async connection for better FreeRTOS task integration:
+
+```c
+nats.connect_async([](bool success) {
+    if (success) {
+        ESP_LOGI(TAG, "Connected!");
+        // Start subscribing, publishing, etc.
+    } else {
+        ESP_LOGE(TAG, "Connection failed!");
+    }
+});
+
+// Continue with other work while connecting
+while (1) {
+    nats.process();  // Handles async connection
+    vTaskDelay(pdMS_TO_TICKS(10));
+}
+```
+
+### JetStream Support
+
+Publish with guaranteed delivery using JetStream:
+
+```c
+nats.jetstream_publish(
+    "orders",                          // subject
+    "{\"id\":123,\"item\":\"widget\"}", // message
+    [](NATS::msg e) {                  // ACK callback
+        ESP_LOGI(TAG, "Message acknowledged: %s", e.data);
+    },
+    []() {                             // timeout callback
+        ESP_LOGW(TAG, "JetStream ACK timeout!");
+    },
+    5000                               // timeout (ms)
+);
+```
+
+## Reliability Features
+
+### Connection Metrics
+
+Track connection health and message statistics:
+
+```c
+nats_connection_metrics_t metrics = nats.get_metrics();
+
+ESP_LOGI(TAG, "Messages sent: %llu", metrics.msgs_sent);
+ESP_LOGI(TAG, "Messages received: %llu", metrics.msgs_received);
+ESP_LOGI(TAG, "Bytes sent: %llu", metrics.bytes_sent);
+ESP_LOGI(TAG, "Bytes received: %llu", metrics.bytes_received);
+ESP_LOGI(TAG, "Reconnections: %u", metrics.reconnections);
+ESP_LOGI(TAG, "Uptime: %lu ms", metrics.uptime);
+```
+
+### Error Handling
+
+Get detailed error information when operations fail:
+
+```c
+if (!nats.connect()) {
+    nats_error_code_t err = nats.last_error();
+    ESP_LOGE(TAG, "Connection failed: %s", nats.last_error_string());
+
+    // Handle specific error codes
+    if (err == NATS_ERR_DNS_RESOLUTION_FAILED) {
+        ESP_LOGE(TAG, "Check your DNS settings");
+    } else if (err == NATS_ERR_TLS_CONNECTION_FAILED) {
+        ESP_LOGE(TAG, "Check your TLS certificates");
+    }
+}
+```
+
+Available error codes:
+- `NATS_ERR_NONE` - No error
+- `NATS_ERR_CONNECTION_FAILED` - TCP connection failed
+- `NATS_ERR_DNS_RESOLUTION_FAILED` - Hostname lookup failed
+- `NATS_ERR_TLS_INIT_FAILED` - TLS initialization failed
+- `NATS_ERR_TLS_CONNECTION_FAILED` - TLS handshake failed
+- `NATS_ERR_PROTOCOL_ERROR` - NATS protocol error from server
+- `NATS_ERR_MAX_PINGS_EXCEEDED` - Too many outstanding pings
+- `NATS_ERR_DISCONNECTED` - Disconnected from server
+- `NATS_ERR_NOT_CONNECTED` - Operation requires connection
+
+### Message Buffering
+
+Automatically buffer messages when offline and replay them on reconnect:
+
+```c
+// Enable message buffering (enabled by default)
+nats.message_buffering_enabled = true;
+nats.max_pending_messages = 100;  // Buffer up to 100 messages
+
+// Messages published while offline are automatically buffered
+nats.publish("sensor.data", "{\"temp\":25.5}");
+nats.publish("sensor.data", "{\"temp\":26.0}");
+
+// When connection is restored, buffered messages are sent automatically
+```
+
+This is particularly useful for IoT devices with intermittent connectivity.
+
+### Flush Pending Writes
+
+Ensure all published messages have been sent to the server:
+
+```c
+nats.publish("critical.alert", "System overload");
+
+// Wait for the message to be sent (max 5 seconds)
+if (nats.flush(5000)) {
+    ESP_LOGI(TAG, "Message delivered");
+} else {
+    ESP_LOGW(TAG, "Flush timeout");
+}
+```
+
+### Graceful Shutdown with Drain
+
+Properly close the connection by unsubscribing and flushing:
+
+```c
+// Drain will:
+// 1. Unsubscribe from all subscriptions
+// 2. Flush pending messages
+// 3. Close the connection
+nats.drain(5000);  // 5 second timeout
+```
+
+### Exponential Backoff Reconnect
+
+Smart reconnection with increasing delays to avoid overwhelming the server:
+
+```c
+// Exponential backoff is enabled by default
+nats.exponential_backoff_enabled = true;
+
+// Reconnection delays: 1s, 2s, 4s, 8s, 16s, 30s (max)
+// Configure in espidf_nats.h:
+// #define NATS_RECONNECT_INTERVAL 1000UL        // Initial delay
+// #define NATS_MAX_RECONNECT_DELAY 30000UL      // Maximum delay
+```
+
+The library automatically increases the delay between reconnection attempts, helping to reduce server load during outages.
+
+## Configuration
+
+Common configuration options can be customized by defining them before including the header:
+
+```c
+#define NATS_PING_INTERVAL 120000UL              // Ping interval (ms)
+#define NATS_RECONNECT_INTERVAL 1000UL           // Initial reconnect delay (ms)
+#define NATS_MAX_RECONNECT_DELAY 30000UL         // Max reconnect delay (ms)
+#define NATS_MAX_PENDING_MESSAGES 100            // Max buffered messages
+#include "espidf_nats.h"
 ```
