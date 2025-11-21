@@ -58,6 +58,10 @@ namespace NATSUtil {
         public:
             Array(size_t cap = 32) : len(0), cap(cap) {
                 data = (T*)malloc(cap * sizeof(T));
+                if (data == NULL) {
+                    ESP_LOGE("Array", "Failed to allocate array");
+                    this->cap = 0;
+                }
             }
 
             ~Array() { free(data); }
@@ -102,6 +106,10 @@ namespace NATSUtil {
                 cap = 32;
                 free(data);
                 data = (T*)malloc(cap * sizeof(T));
+                if (data == NULL) {
+                    ESP_LOGE("Array", "Failed to allocate array in empty()");
+                    cap = 0;
+                }
             }
 
             T const& operator[](size_t i) const { return data[i]; }

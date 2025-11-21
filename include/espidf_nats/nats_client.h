@@ -63,6 +63,7 @@ class NATS {
         bool draining;
         SemaphoreHandle_t mutex;          // Protects data structures (subs, pending_messages)
         SemaphoreHandle_t io_mutex;       // Protects TLS/socket I/O operations
+        SemaphoreHandle_t state_mutex;    // Protects outstanding_pings and reconnect_attempts
 
     public:
         bool connected;
@@ -116,12 +117,14 @@ class NATS {
                 draining = false;
                 mutex = xSemaphoreCreateMutex();
                 io_mutex = xSemaphoreCreateMutex();
-                if (mutex == NULL || io_mutex == NULL) {
+                state_mutex = xSemaphoreCreateMutex();
+                if (mutex == NULL || io_mutex == NULL || state_mutex == NULL) {
                     ESP_LOGE(tag, "Failed to create mutex - out of memory");
                     last_error_code = NATS_ERR_OUT_OF_MEMORY;
                     if (mutex != NULL) vSemaphoreDelete(mutex);
                     if (io_mutex != NULL) vSemaphoreDelete(io_mutex);
-                    mutex = io_mutex = NULL;
+                    if (state_mutex != NULL) vSemaphoreDelete(state_mutex);
+                    mutex = io_mutex = state_mutex = NULL;
                 } else {
                     // Validate TLS configuration if provided
                     if (!validate_tls_config()) {
@@ -174,12 +177,14 @@ class NATS {
                 draining = false;
                 mutex = xSemaphoreCreateMutex();
                 io_mutex = xSemaphoreCreateMutex();
-                if (mutex == NULL || io_mutex == NULL) {
+                state_mutex = xSemaphoreCreateMutex();
+                if (mutex == NULL || io_mutex == NULL || state_mutex == NULL) {
                     ESP_LOGE(tag, "Failed to create mutex - out of memory");
                     last_error_code = NATS_ERR_OUT_OF_MEMORY;
                     if (mutex != NULL) vSemaphoreDelete(mutex);
                     if (io_mutex != NULL) vSemaphoreDelete(io_mutex);
-                    mutex = io_mutex = NULL;
+                    if (state_mutex != NULL) vSemaphoreDelete(state_mutex);
+                    mutex = io_mutex = state_mutex = NULL;
                 } else {
                     // Validate TLS configuration if provided
                     if (!validate_tls_config()) {
@@ -221,6 +226,10 @@ class NATS {
                 if (io_mutex != NULL) {
                     vSemaphoreDelete(io_mutex);
                     io_mutex = NULL;
+                }
+                if (state_mutex != NULL) {
+                    vSemaphoreDelete(state_mutex);
+                    state_mutex = NULL;
                 }
             }
         }
@@ -325,6 +334,11 @@ class NATS {
             va_end(ap2);
             size += 1;
             *strp = (char*)malloc(size * sizeof(char));
+            if (*strp == NULL) {
+                ESP_LOGE(tag, "Failed to allocate memory in vasprintf");
+                last_error_code = NATS_ERR_OUT_OF_MEMORY;
+                return -1;
+            }
             return vsnprintf(*strp, size, fmt, ap);
         }
 
@@ -332,10 +346,12 @@ class NATS {
             va_list args;
             va_start(args, fmt);
             char* buf;
-            vasprintf(&buf, fmt, args);
+            int ret = vasprintf(&buf, fmt, args);
             va_end(args);
-            send(buf);
-            free(buf);
+            if (ret >= 0) {
+                send(buf);
+                free(buf);
+            }
         }
 
         void send_connect() {
@@ -565,7 +581,9 @@ class NATS {
                 send(NATS_CTRL_PONG);
             }
             else if (strcmp(argv[0], NATS_CTRL_PONG) == 0) {
+                if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
                 outstanding_pings--;
+                if (state_mutex != NULL) xSemaphoreGive(state_mutex);
             }
             else if (strcmp(argv[0], NATS_CTRL_INFO) == 0) {
                 send_connect();
@@ -578,12 +596,20 @@ class NATS {
         }
 
         void ping() {
-            if (outstanding_pings > max_outstanding_pings) {
+            if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
+            int pings = outstanding_pings;
+            if (state_mutex != NULL) xSemaphoreGive(state_mutex);
+
+            if (pings > max_outstanding_pings) {
                 last_error_code = NATS_ERR_MAX_PINGS_EXCEEDED;
                 disconnect();
                 return;
             }
+
+            if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
             outstanding_pings++;
+            if (state_mutex != NULL) xSemaphoreGive(state_mutex);
+
             send(NATS_CTRL_PING);
         }
 
@@ -791,8 +817,10 @@ class NATS {
                     servers[current_server_idx].port);
 
                 if (try_connect_to_server(servers[current_server_idx])) {
+                    if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
                     outstanding_pings = 0;
                     reconnect_attempts = 0;
+                    if (state_mutex != NULL) xSemaphoreGive(state_mutex);
                     connect_state = CONNECTING;
                     metrics.last_connect_time = NATSUtil::millis();
                     if (metrics.reconnections > 0 || connected) {
@@ -809,7 +837,9 @@ class NATS {
             } while (current_server_idx != start_idx);
 
             // All servers failed
+            if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
             reconnect_attempts++;
+            if (state_mutex != NULL) xSemaphoreGive(state_mutex);
             connect_state = DISCONNECTED;
             return false;
         }
@@ -1007,20 +1037,233 @@ class NATS {
             return sid;
         }
 
-        // Basic JetStream publish with ACK
-        int jetstream_publish(const char* subject, const char* msg, sub_cb ack_cb, timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
+        // JetStream publish with ACK and optional deduplication
+        int jetstream_publish(const char* subject, const char* msg, sub_cb ack_cb,
+                             timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000,
+                             const char* msg_id = NULL) {
             if (subject == NULL || subject[0] == 0) return -1;
             if (!connected) return -1;
 
             // Build JetStream API subject: $JS.API.PUBLISH.<subject>
             size_t api_subject_len = strlen("$JS.API.PUBLISH.") + strlen(subject) + 1;
             char* api_subject = (char*)malloc(api_subject_len);
+            if (api_subject == NULL) return -1;
             snprintf(api_subject, api_subject_len, "$JS.API.PUBLISH.%s", subject);
 
-            int sid = request_with_timeout(api_subject, msg, ack_cb, timeout_ms, on_timeout, 1);
+            int sid;
+            if (msg_id != NULL) {
+                // Use headers for message deduplication
+                char headers[256];
+                snprintf(headers, sizeof(headers), "NATS/1.0\r\nNats-Msg-Id: %s\r\n\r\n", msg_id);
+
+                char* inbox = generate_inbox_subject();
+                if (inbox == NULL) {
+                    free(api_subject);
+                    return -1;
+                }
+
+                xSemaphoreTake(mutex, portMAX_DELAY);
+                Sub* sub = new Sub(ack_cb, 1, timeout_ms, on_timeout);
+                if (free_sids.empty()) {
+                    sid = subs.push_back(sub);
+                } else {
+                    sid = free_sids.pop();
+                    subs[sid] = sub;
+                }
+                send_fmt("SUB %s %d", inbox, sid);
+                xSemaphoreGive(mutex);
+
+                publish_with_headers(api_subject, headers, msg, inbox);
+                free(inbox);
+            } else {
+                sid = request_with_timeout(api_subject, msg, ack_cb, timeout_ms, on_timeout, 1);
+            }
 
             free(api_subject);
             return sid;
+        }
+
+        // Create a JetStream stream
+        int jetstream_stream_create(const jetstream_stream_config_t* config, sub_cb response_cb,
+                                   timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
+            if (config == NULL || config->name == NULL) return -1;
+            if (!connected) return -1;
+
+            // Build JSON configuration
+            char* json = (char*)malloc(2048);
+            if (json == NULL) return -1;
+
+            int offset = snprintf(json, 2048, "{\"name\":\"%s\",\"subjects\":[", config->name);
+
+            // Add subjects array
+            if (config->subjects != NULL) {
+                bool first = true;
+                for (size_t i = 0; config->subjects[i] != NULL; i++) {
+                    if (!first) offset += snprintf(json + offset, 2048 - offset, ",");
+                    offset += snprintf(json + offset, 2048 - offset, "\"%s\"", config->subjects[i]);
+                    first = false;
+                }
+            }
+            offset += snprintf(json + offset, 2048 - offset, "]");
+
+            // Add optional parameters
+            if (config->max_msgs > 0) {
+                offset += snprintf(json + offset, 2048 - offset, ",\"max_msgs\":%zu", config->max_msgs);
+            }
+            if (config->max_bytes > 0) {
+                offset += snprintf(json + offset, 2048 - offset, ",\"max_bytes\":%zu", config->max_bytes);
+            }
+            if (config->max_age > 0) {
+                offset += snprintf(json + offset, 2048 - offset, ",\"max_age\":%lld", config->max_age);
+            }
+            if (config->max_msg_size >= 0) {
+                offset += snprintf(json + offset, 2048 - offset, ",\"max_msg_size\":%d", config->max_msg_size);
+            }
+            if (config->storage != NULL) {
+                offset += snprintf(json + offset, 2048 - offset, ",\"storage\":\"%s\"", config->storage);
+            }
+            if (config->replicas > 0) {
+                offset += snprintf(json + offset, 2048 - offset, ",\"num_replicas\":%d", config->replicas);
+            }
+            if (config->discard_new) {
+                offset += snprintf(json + offset, 2048 - offset, ",\"discard\":\"new\"");
+            }
+
+            snprintf(json + offset, 2048 - offset, "}");
+
+            int sid = request_with_timeout("$JS.API.STREAM.CREATE", json, response_cb, timeout_ms, on_timeout, 1);
+            free(json);
+            return sid;
+        }
+
+        // Delete a JetStream stream
+        int jetstream_stream_delete(const char* stream_name, sub_cb response_cb,
+                                   timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
+            if (stream_name == NULL) return -1;
+            if (!connected) return -1;
+
+            char api_subject[256];
+            snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.DELETE.%s", stream_name);
+
+            return request_with_timeout(api_subject, "", response_cb, timeout_ms, on_timeout, 1);
+        }
+
+        // Get JetStream stream information
+        int jetstream_stream_info(const char* stream_name, sub_cb response_cb,
+                                 timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
+            if (stream_name == NULL) return -1;
+            if (!connected) return -1;
+
+            char api_subject[256];
+            snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.INFO.%s", stream_name);
+
+            return request_with_timeout(api_subject, "", response_cb, timeout_ms, on_timeout, 1);
+        }
+
+        // Create a JetStream consumer
+        int jetstream_consumer_create(const jetstream_consumer_config_t* config, sub_cb response_cb,
+                                     timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
+            if (config == NULL || config->stream_name == NULL) return -1;
+            if (!connected) return -1;
+
+            // Build JSON configuration
+            char* json = (char*)malloc(1024);
+            if (json == NULL) return -1;
+
+            int offset = snprintf(json, 1024, "{");
+
+            if (config->durable_name != NULL) {
+                offset += snprintf(json + offset, 1024 - offset, "\"durable_name\":\"%s\",", config->durable_name);
+            }
+            if (config->filter_subject != NULL) {
+                offset += snprintf(json + offset, 1024 - offset, "\"filter_subject\":\"%s\",", config->filter_subject);
+            }
+            if (config->deliver_all) {
+                offset += snprintf(json + offset, 1024 - offset, "\"deliver_policy\":\"all\",");
+            } else {
+                offset += snprintf(json + offset, 1024 - offset, "\"deliver_policy\":\"new\",");
+            }
+            if (config->ack_policy != NULL) {
+                offset += snprintf(json + offset, 1024 - offset, "\"ack_policy\":\"%s\",", config->ack_policy);
+            }
+            if (config->ack_wait > 0) {
+                offset += snprintf(json + offset, 1024 - offset, "\"ack_wait\":%lld,", config->ack_wait);
+            }
+            if (config->max_deliver > 0) {
+                offset += snprintf(json + offset, 1024 - offset, "\"max_deliver\":%d,", config->max_deliver);
+            }
+            if (config->replay_policy != NULL) {
+                offset += snprintf(json + offset, 1024 - offset, "\"replay_policy\":\"%s\",", config->replay_policy);
+            }
+
+            // Remove trailing comma if present
+            if (json[offset - 1] == ',') offset--;
+            snprintf(json + offset, 1024 - offset, "}");
+
+            char api_subject[256];
+            snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.CREATE.%s", config->stream_name);
+
+            int sid = request_with_timeout(api_subject, json, response_cb, timeout_ms, on_timeout, 1);
+            free(json);
+            return sid;
+        }
+
+        // Delete a JetStream consumer
+        int jetstream_consumer_delete(const char* stream_name, const char* consumer_name,
+                                     sub_cb response_cb, timeout_cb on_timeout = NULL,
+                                     unsigned long timeout_ms = 5000) {
+            if (stream_name == NULL || consumer_name == NULL) return -1;
+            if (!connected) return -1;
+
+            char api_subject[256];
+            snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.DELETE.%s.%s",
+                    stream_name, consumer_name);
+
+            return request_with_timeout(api_subject, "", response_cb, timeout_ms, on_timeout, 1);
+        }
+
+        // Pull messages from a JetStream consumer
+        int jetstream_pull(const char* stream_name, const char* consumer_name, int batch_size,
+                          sub_cb message_cb, timeout_cb on_timeout = NULL,
+                          unsigned long timeout_ms = 5000) {
+            if (stream_name == NULL || consumer_name == NULL || batch_size <= 0) return -1;
+            if (!connected) return -1;
+
+            // Build pull request
+            char json[128];
+            snprintf(json, sizeof(json), "{\"batch\":%d,\"no_wait\":true}", batch_size);
+
+            char api_subject[256];
+            snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.MSG.NEXT.%s.%s",
+                    stream_name, consumer_name);
+
+            return request_with_timeout(api_subject, json, message_cb, timeout_ms, on_timeout, batch_size);
+        }
+
+        // Acknowledge a JetStream message
+        void jetstream_ack(const char* reply_subject) {
+            if (reply_subject == NULL || reply_subject[0] == 0) return;
+            if (!connected) return;
+            publish(reply_subject, "+ACK");
+        }
+
+        // Negative acknowledge (redeliver message)
+        void jetstream_nak(const char* reply_subject) {
+            if (reply_subject == NULL || reply_subject[0] == 0) return;
+            if (!connected) return;
+            publish(reply_subject, "-NAK");
+        }
+
+        // Acknowledge with delay (redeliver after delay)
+        void jetstream_ack_delay(const char* reply_subject, unsigned long delay_ms) {
+            if (reply_subject == NULL || reply_subject[0] == 0) return;
+            if (!connected) return;
+
+            // Convert milliseconds to nanoseconds
+            int64_t delay_ns = delay_ms * 1000000LL;
+            char msg[64];
+            snprintf(msg, sizeof(msg), "+NAK {\"delay\":%lld}", delay_ns);
+            publish(reply_subject, msg);
         }
 
         nats_connection_metrics_t get_metrics() {
@@ -1193,7 +1436,12 @@ class NATS {
                     ping();
             } else {
                 disconnect();
-                if (max_reconnect_attempts == -1 || reconnect_attempts < max_reconnect_attempts) {
+                // Protect reconnect_attempts read with mutex
+                if (state_mutex != NULL) xSemaphoreTake(state_mutex, portMAX_DELAY);
+                int attempts = reconnect_attempts;
+                if (state_mutex != NULL) xSemaphoreGive(state_mutex);
+
+                if (max_reconnect_attempts == -1 || attempts < max_reconnect_attempts) {
                     unsigned long current_time = NATSUtil::millis();
                     unsigned long reconnect_delay = get_reconnect_delay();
 

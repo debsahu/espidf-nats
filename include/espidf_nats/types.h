@@ -69,4 +69,33 @@ typedef struct {
     char* headers;                     // NATS headers (HPUB)
 } pending_msg_t;
 
+/**
+ * JetStream stream configuration
+ */
+typedef struct {
+    const char* name;                  // Stream name
+    const char** subjects;             // Array of subjects (NULL-terminated)
+    size_t max_msgs;                   // Maximum number of messages
+    size_t max_bytes;                  // Maximum total bytes
+    int64_t max_age;                   // Maximum age in nanoseconds (0 = unlimited)
+    int max_msg_size;                  // Maximum message size (-1 = unlimited)
+    const char* storage;               // "file" or "memory"
+    int replicas;                      // Number of replicas (1-5)
+    bool discard_new;                  // Discard new messages when limits hit
+} jetstream_stream_config_t;
+
+/**
+ * JetStream consumer configuration
+ */
+typedef struct {
+    const char* stream_name;           // Stream name
+    const char* durable_name;          // Durable consumer name (optional)
+    const char* filter_subject;        // Filter by subject (optional)
+    bool deliver_all;                  // Deliver all messages (vs. new only)
+    const char* ack_policy;            // "explicit", "all", "none"
+    int64_t ack_wait;                  // Ack wait time in nanoseconds
+    int max_deliver;                   // Maximum delivery attempts (-1 = unlimited)
+    const char* replay_policy;         // "instant" or "original"
+} jetstream_consumer_config_t;
+
 #endif // ESPIDF_NATS_TYPES_H

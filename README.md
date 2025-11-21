@@ -6,7 +6,7 @@ This module is was ported from https://github.com/isobit/arduino-nats and aims t
 
 ## Features
 
-- Header-only library
+- ESP-IDF component with header-only C++ implementation
 - Compatible with Ethernet and WiFi-capable ESP32s
 - Familiar C++ object-oriented API, similar usage to the official NATS client
   APIs
@@ -17,7 +17,7 @@ This module is was ported from https://github.com/isobit/arduino-nats and aims t
 - **NATS 2.0 Headers** - Publish and receive messages with headers (HPUB/HMSG)
 - **Request timeouts** - Prevent hanging requests with configurable timeouts
 - **Async/non-blocking API** - connect_async() for better FreeRTOS integration
-- **Basic JetStream support** - Publish with acknowledgment for guaranteed delivery
+- **Comprehensive JetStream support** - Streams, consumers, pull-based delivery, message deduplication, and ACK controls
 - **Connection metrics** - Track messages/bytes sent/received, reconnections, and uptime
 - **Error handling** - Detailed error codes with last_error() for diagnostics
 - **Message buffering** - Automatic offline message queuing and replay on reconnect
@@ -26,7 +26,25 @@ This module is was ported from https://github.com/isobit/arduino-nats and aims t
 
 ### Installation
 
-Just download [`espidf_nats.h`](https://raw.githubusercontent.com/daed/espidf-nats/master/espidf_nats.h) and include it in your code, or clone the entire repository as an ESP-IDF component.
+Clone the repository as an ESP-IDF component:
+
+```bash
+cd your-esp-idf-project/components
+git clone https://github.com/daed/espidf-nats.git
+```
+
+Or add as a git submodule:
+
+```bash
+cd your-esp-idf-project
+git submodule add https://github.com/daed/espidf-nats.git components/espidf-nats
+```
+
+Then include in your code:
+
+```cpp
+#include "espidf_nats.h"
+```
 
 ### Library Structure
 
@@ -229,19 +247,161 @@ while (1) {
 
 ### JetStream Support
 
-Publish with guaranteed delivery using JetStream:
+Comprehensive JetStream support for guaranteed message delivery, persistence, and advanced streaming patterns.
+
+#### Creating Streams
 
 ```c
+const char* subjects[] = {"orders.*", "inventory.*", NULL};
+
+jetstream_stream_config_t stream_config = {
+    .name = "ORDERS",
+    .subjects = subjects,
+    .max_msgs = 10000,
+    .max_bytes = 10485760,  // 10 MB
+    .max_age = 86400000000000LL,  // 24 hours in nanoseconds
+    .max_msg_size = 1048576,  // 1 MB
+    .storage = "file",
+    .replicas = 1,
+    .discard_new = false
+};
+
+nats.jetstream_stream_create(
+    &stream_config,
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Stream created: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout creating stream"); },
+    5000
+);
+```
+
+#### Publishing with Acknowledgment
+
+```c
+// Basic publish with ACK
 nats.jetstream_publish(
-    "orders",                          // subject
-    "{\"id\":123,\"item\":\"widget\"}", // message
-    [](NATS::msg e) {                  // ACK callback
+    "orders.new",
+    "{\"id\":123,\"item\":\"widget\"}",
+    [](NATS::msg e) {
         ESP_LOGI(TAG, "Message acknowledged: %s", e.data);
     },
-    []() {                             // timeout callback
-        ESP_LOGW(TAG, "JetStream ACK timeout!");
+    []() { ESP_LOGW(TAG, "JetStream ACK timeout!"); },
+    5000
+);
+
+// Publish with message deduplication
+nats.jetstream_publish(
+    "orders.new",
+    "{\"id\":123,\"item\":\"widget\"}",
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Deduplicated ACK: %s", e.data);
     },
-    5000                               // timeout (ms)
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000,
+    "order-123"  // Message ID for deduplication
+);
+```
+
+#### Creating Consumers
+
+```c
+jetstream_consumer_config_t consumer_config = {
+    .stream_name = "ORDERS",
+    .durable_name = "order-processor",
+    .filter_subject = "orders.new",
+    .deliver_all = true,
+    .ack_policy = "explicit",
+    .ack_wait = 30000000000LL,  // 30 seconds in nanoseconds
+    .max_deliver = 3,
+    .replay_policy = "instant"
+};
+
+nats.jetstream_consumer_create(
+    &consumer_config,
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Consumer created: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout creating consumer"); },
+    5000
+);
+```
+
+#### Pull-Based Message Consumption
+
+```c
+// Pull batch of messages from consumer
+nats.jetstream_pull(
+    "ORDERS",                  // stream name
+    "order-processor",         // consumer name
+    10,                        // batch size
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Received: %.*s", e.size, e.data);
+
+        // Process message...
+
+        // Acknowledge successful processing
+        nats.jetstream_ack(e.reply);
+
+        // Or negative acknowledge to redeliver
+        // nats.jetstream_nak(e.reply);
+
+        // Or delay redelivery by 5 seconds
+        // nats.jetstream_ack_delay(e.reply, 5000);
+    },
+    []() { ESP_LOGW(TAG, "Pull timeout"); },
+    5000
+);
+```
+
+#### Message Acknowledgment
+
+```c
+// Process message from JetStream consumer
+nats.subscribe("orders.new", [](NATS::msg e) {
+    // Acknowledge successful processing
+    nats.jetstream_ack(e.reply);
+
+    // Or negative acknowledge (request redelivery)
+    // nats.jetstream_nak(e.reply);
+
+    // Or acknowledge with delayed redelivery (5 seconds)
+    // nats.jetstream_ack_delay(e.reply, 5000);
+});
+```
+
+#### Stream Management
+
+```c
+// Get stream information
+nats.jetstream_stream_info(
+    "ORDERS",
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Stream info: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+
+// Delete stream
+nats.jetstream_stream_delete(
+    "ORDERS",
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Stream deleted: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+
+// Delete consumer
+nats.jetstream_consumer_delete(
+    "ORDERS",
+    "order-processor",
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Consumer deleted: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
 );
 ```
 
