@@ -1266,6 +1266,293 @@ class NATS {
             publish(reply_subject, msg);
         }
 
+        // ==================== JetStream Fetch Operations ====================
+
+        // Fetch messages with advanced options
+        int jetstream_fetch(const char* stream_name, const char* consumer_name,
+                           const jetstream_fetch_request_t* fetch_config,
+                           sub_cb message_cb, timeout_cb on_timeout = NULL,
+                           unsigned long timeout_ms = 5000) {
+            if (stream_name == NULL || consumer_name == NULL || fetch_config == NULL) return -1;
+            if (fetch_config->batch <= 0) return -1;
+            if (!connected) return -1;
+
+            // Build fetch request JSON
+            char json[256];
+            int offset = snprintf(json, sizeof(json), "{\"batch\":%d", fetch_config->batch);
+
+            if (fetch_config->max_bytes > 0) {
+                offset += snprintf(json + offset, sizeof(json) - offset, ",\"max_bytes\":%zu", fetch_config->max_bytes);
+            }
+            if (fetch_config->expires > 0) {
+                offset += snprintf(json + offset, sizeof(json) - offset, ",\"expires\":%lld", fetch_config->expires);
+            }
+            if (fetch_config->heartbeat > 0) {
+                offset += snprintf(json + offset, sizeof(json) - offset, ",\"idle_heartbeat\":%lld", fetch_config->heartbeat);
+            }
+            if (fetch_config->no_wait) {
+                offset += snprintf(json + offset, sizeof(json) - offset, ",\"no_wait\":true");
+            }
+
+            snprintf(json + offset, sizeof(json) - offset, "}");
+
+            char api_subject[256];
+            snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.MSG.NEXT.%s.%s",
+                    stream_name, consumer_name);
+
+            return request_with_timeout(api_subject, json, message_cb, timeout_ms, on_timeout, fetch_config->batch);
+        }
+
+        // ==================== JetStream Account Info ====================
+
+        // Get JetStream account information
+        int jetstream_account_info(sub_cb response_cb, timeout_cb on_timeout = NULL,
+                                   unsigned long timeout_ms = 5000) {
+            if (!connected) return -1;
+            return request_with_timeout("$JS.API.INFO", "", response_cb, timeout_ms, on_timeout, 1);
+        }
+
+        // ==================== JetStream Ordered Consumers ====================
+
+        // Create an ordered consumer (simplified API for guaranteed in-order delivery)
+        int jetstream_consumer_create_ordered(const char* stream_name, const char* filter_subject,
+                                              sub_cb response_cb, timeout_cb on_timeout = NULL,
+                                              unsigned long timeout_ms = 5000) {
+            if (stream_name == NULL) return -1;
+            if (!connected) return -1;
+
+            // Build JSON configuration for ordered consumer
+            char* json = (char*)malloc(512);
+            if (json == NULL) return -1;
+
+            int offset = snprintf(json, 512, "{\"deliver_policy\":\"all\",\"ack_policy\":\"none\"");
+            offset += snprintf(json + offset, 512 - offset, ",\"flow_control\":true,\"idle_heartbeat\":5000000000");
+
+            if (filter_subject != NULL) {
+                offset += snprintf(json + offset, 512 - offset, ",\"filter_subject\":\"%s\"", filter_subject);
+            }
+
+            // Ordered consumers are always ephemeral (no durable_name)
+            snprintf(json + offset, 512 - offset, "}");
+
+            char api_subject[256];
+            snprintf(api_subject, sizeof(api_subject), "$JS.API.CONSUMER.CREATE.%s", stream_name);
+
+            int sid = request_with_timeout(api_subject, json, response_cb, timeout_ms, on_timeout, 1);
+            free(json);
+            return sid;
+        }
+
+        // ==================== Key-Value Store ====================
+
+        // Create a Key-Value bucket
+        int kv_create_bucket(const kv_config_t* config, sub_cb response_cb,
+                            timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
+            if (config == NULL || config->bucket == NULL) return -1;
+            if (!connected) return -1;
+
+            // KV bucket is implemented as a JetStream stream with specific configuration
+            char* json = (char*)malloc(2048);
+            if (json == NULL) return -1;
+
+            // Stream name is "KV_<bucket>"
+            int offset = snprintf(json, 2048, "{\"name\":\"KV_%s\",\"subjects\":[\"$KV.%s.>\"]}",
+                                config->bucket, config->bucket);
+
+            // KV-specific stream configuration
+            offset += snprintf(json + offset, 2048 - offset, ",\"discard\":\"new\",\"allow_rollup_hdrs\":true");
+            offset += snprintf(json + offset, 2048 - offset, ",\"deny_delete\":true,\"deny_purge\":false");
+
+            // History (max_msgs_per_subject)
+            int64_t history = (config->history > 0 && config->history <= 64) ? config->history : 1;
+            offset += snprintf(json + offset, 2048 - offset, ",\"max_msgs_per_subject\":%lld", history);
+
+            // TTL (max_age)
+            if (config->ttl > 0) {
+                offset += snprintf(json + offset, 2048 - offset, ",\"max_age\":%lld", config->ttl);
+            }
+
+            // Max value size (max_msg_size)
+            if (config->max_value_size > 0) {
+                offset += snprintf(json + offset, 2048 - offset, ",\"max_msg_size\":%zu", config->max_value_size);
+            }
+
+            // Storage type
+            if (config->storage != NULL) {
+                offset += snprintf(json + offset, 2048 - offset, ",\"storage\":\"%s\"", config->storage);
+            }
+
+            // Replicas
+            if (config->replicas > 0) {
+                offset += snprintf(json + offset, 2048 - offset, ",\"num_replicas\":%d", config->replicas);
+            }
+
+            // Max bucket bytes
+            if (config->max_bytes > 0) {
+                offset += snprintf(json + offset, 2048 - offset, ",\"max_bytes\":%zu", config->max_bytes);
+            }
+
+            snprintf(json + offset, 2048 - offset, "}");
+
+            int sid = request_with_timeout("$JS.API.STREAM.CREATE", json, response_cb, timeout_ms, on_timeout, 1);
+            free(json);
+            return sid;
+        }
+
+        // Get value for a key from KV bucket
+        int kv_get(const char* bucket, const char* key, sub_cb response_cb,
+                  timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
+            if (bucket == NULL || key == NULL) return -1;
+            if (!connected) return -1;
+
+            // Request last message for subject $KV.<bucket>.<key>
+            char* json = (char*)malloc(512);
+            if (json == NULL) return -1;
+
+            snprintf(json, 512, "{\"last_by_subj\":\"$KV.%s.%s\"}", bucket, key);
+
+            char stream_name[256];
+            snprintf(stream_name, sizeof(stream_name), "KV_%s", bucket);
+
+            char api_subject[256];
+            snprintf(api_subject, sizeof(api_subject), "$JS.API.STREAM.MSG.GET.%s", stream_name);
+
+            int sid = request_with_timeout(api_subject, json, response_cb, timeout_ms, on_timeout, 1);
+            free(json);
+            return sid;
+        }
+
+        // Put a key-value pair into KV bucket
+        int kv_put(const char* bucket, const char* key, const char* value,
+                  sub_cb ack_cb, timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
+            if (bucket == NULL || key == NULL) return -1;
+            if (!connected) return -1;
+
+            // Publish to subject $KV.<bucket>.<key>
+            char subject[256];
+            snprintf(subject, sizeof(subject), "$KV.%s.%s", bucket, key);
+
+            return jetstream_publish(subject, value, ack_cb, on_timeout, timeout_ms, NULL);
+        }
+
+        // Delete a key from KV bucket (soft delete with tombstone)
+        int kv_delete(const char* bucket, const char* key, sub_cb ack_cb,
+                     timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
+            if (bucket == NULL || key == NULL) return -1;
+            if (!connected) return -1;
+
+            // Publish with special headers indicating delete
+            char subject[256];
+            snprintf(subject, sizeof(subject), "$KV.%s.%s", bucket, key);
+
+            const char* headers = "NATS/1.0\r\nKV-Operation: DEL\r\n\r\n";
+
+            char* inbox = generate_inbox_subject();
+            if (inbox == NULL) return -1;
+
+            xSemaphoreTake(mutex, portMAX_DELAY);
+            Sub* sub = new Sub(ack_cb, 1, timeout_ms, on_timeout);
+            int sid;
+            if (free_sids.empty()) {
+                sid = subs.push_back(sub);
+            } else {
+                sid = free_sids.pop();
+                subs[sid] = sub;
+            }
+            send_fmt("SUB %s %d", inbox, sid);
+            xSemaphoreGive(mutex);
+
+            publish_with_headers(subject, headers, "", inbox);
+            free(inbox);
+            return sid;
+        }
+
+        // Purge all revisions of a key from KV bucket
+        int kv_purge(const char* bucket, const char* key, sub_cb ack_cb,
+                    timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
+            if (bucket == NULL || key == NULL) return -1;
+            if (!connected) return -1;
+
+            // Publish with special headers indicating purge
+            char subject[256];
+            snprintf(subject, sizeof(subject), "$KV.%s.%s", bucket, key);
+
+            const char* headers = "NATS/1.0\r\nKV-Operation: PURGE\r\nNats-Rollup: sub\r\n\r\n";
+
+            char* inbox = generate_inbox_subject();
+            if (inbox == NULL) return -1;
+
+            xSemaphoreTake(mutex, portMAX_DELAY);
+            Sub* sub = new Sub(ack_cb, 1, timeout_ms, on_timeout);
+            int sid;
+            if (free_sids.empty()) {
+                sid = subs.push_back(sub);
+            } else {
+                sid = free_sids.pop();
+                subs[sid] = sub;
+            }
+            send_fmt("SUB %s %d", inbox, sid);
+            xSemaphoreGive(mutex);
+
+            publish_with_headers(subject, headers, "", inbox);
+            free(inbox);
+            return sid;
+        }
+
+        // List all keys in KV bucket
+        int kv_keys(const char* bucket, sub_cb response_cb,
+                   timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
+            if (bucket == NULL) return -1;
+            if (!connected) return -1;
+
+            // Get stream info to list keys
+            char stream_name[256];
+            snprintf(stream_name, sizeof(stream_name), "KV_%s", bucket);
+
+            return jetstream_stream_info(stream_name, response_cb, on_timeout, timeout_ms);
+        }
+
+        // Watch a key or key pattern for changes
+        int kv_watch(const char* bucket, const char* key_pattern, sub_cb message_cb,
+                    const kv_watch_options_t* options = NULL) {
+            if (bucket == NULL || key_pattern == NULL) return -1;
+            if (!connected) return -1;
+
+            // Subscribe to $KV.<bucket>.<key_pattern>
+            char subject[256];
+            snprintf(subject, sizeof(subject), "$KV.%s.%s", bucket, key_pattern);
+
+            return subscribe(subject, message_cb, NULL, 0);
+        }
+
+        // Get history of a key (all revisions)
+        int kv_history(const char* bucket, const char* key, sub_cb response_cb,
+                      timeout_cb on_timeout = NULL, unsigned long timeout_ms = 5000) {
+            if (bucket == NULL || key == NULL) return -1;
+            if (!connected) return -1;
+
+            // Create a consumer to get all messages for this key
+            char stream_name[256];
+            snprintf(stream_name, sizeof(stream_name), "KV_%s", bucket);
+
+            char filter_subject[256];
+            snprintf(filter_subject, sizeof(filter_subject), "$KV.%s.%s", bucket, key);
+
+            jetstream_consumer_config_t consumer_config = {
+                .stream_name = stream_name,
+                .durable_name = NULL,  // Ephemeral
+                .filter_subject = filter_subject,
+                .deliver_all = true,
+                .ack_policy = "none",
+                .ack_wait = 0,
+                .max_deliver = -1,
+                .replay_policy = "instant",
+                .ordered = false
+            };
+
+            return jetstream_consumer_create(&consumer_config, response_cb, on_timeout, timeout_ms);
+        }
+
         nats_connection_metrics_t get_metrics() {
             nats_connection_metrics_t current_metrics = metrics;
             if (connected && metrics.last_connect_time > 0) {

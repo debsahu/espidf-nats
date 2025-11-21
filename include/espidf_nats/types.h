@@ -96,6 +96,70 @@ typedef struct {
     int64_t ack_wait;                  // Ack wait time in nanoseconds
     int max_deliver;                   // Maximum delivery attempts (-1 = unlimited)
     const char* replay_policy;         // "instant" or "original"
+    bool ordered;                      // Create ordered consumer (ephemeral, guaranteed order)
 } jetstream_consumer_config_t;
+
+/**
+ * JetStream fetch request configuration
+ */
+typedef struct {
+    int batch;                         // Number of messages to fetch
+    size_t max_bytes;                  // Maximum bytes to fetch (0 = unlimited)
+    int64_t expires;                   // Request expiration in nanoseconds
+    int64_t heartbeat;                 // Idle heartbeat interval in nanoseconds
+    bool no_wait;                      // Don't wait if no messages available
+} jetstream_fetch_request_t;
+
+/**
+ * JetStream account information
+ */
+typedef struct {
+    int64_t memory;                    // Memory storage used (bytes)
+    int64_t storage;                   // File storage used (bytes)
+    int64_t streams;                   // Number of streams
+    int64_t consumers;                 // Number of consumers
+    int64_t memory_max;                // Memory storage limit (-1 = unlimited)
+    int64_t storage_max;               // File storage limit (-1 = unlimited)
+    int64_t streams_max;               // Stream count limit (-1 = unlimited)
+    int64_t consumers_max;             // Consumer count limit (-1 = unlimited)
+} jetstream_account_info_t;
+
+/**
+ * Key-Value bucket configuration
+ */
+typedef struct {
+    const char* bucket;                // Bucket name
+    const char* description;           // Bucket description (optional)
+    size_t max_value_size;             // Maximum value size in bytes (-1 = unlimited)
+    int64_t history;                   // Number of historical values per key (1-64, default 1)
+    int64_t ttl;                       // Time-to-live for values in nanoseconds (0 = unlimited)
+    const char* storage;               // "file" or "memory"
+    int replicas;                      // Number of replicas (1-5)
+    size_t max_bytes;                  // Maximum total bytes for bucket (0 = unlimited)
+} kv_config_t;
+
+/**
+ * Key-Value entry
+ */
+typedef struct {
+    const char* bucket;                // Bucket name
+    const char* key;                   // Key name
+    const char* value;                 // Value data
+    size_t value_len;                  // Value length
+    uint64_t revision;                 // Entry revision number
+    uint64_t created;                  // Creation timestamp (nanoseconds)
+    const char* operation;             // Operation type: "PUT", "DEL", "PURGE"
+    int64_t delta;                     // Distance from latest value
+} kv_entry_t;
+
+/**
+ * Key-Value watch options
+ */
+typedef struct {
+    bool include_history;              // Include historical values
+    bool ignore_deletes;               // Ignore delete markers
+    bool meta_only;                    // Only metadata, no values
+    int64_t updates_only;              // Only updates after revision N
+} kv_watch_options_t;
 
 #endif // ESPIDF_NATS_TYPES_H

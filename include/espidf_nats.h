@@ -13,7 +13,11 @@
  * - NATS 2.0 Headers support (HPUB/HMSG)
  * - Request timeouts - Prevent hanging requests
  * - Async/non-blocking API
- * - Basic JetStream support
+ * - Comprehensive JetStream support (streams, consumers, pull, ACK controls, deduplication)
+ * - Key-Value Store (distributed config/state with revision history, TTL, watchers)
+ * - Ordered Consumers (guaranteed in-order delivery)
+ * - Fetch Operations (efficient batch message retrieval)
+ * - Account Info (quota and resource monitoring)
  * - Connection metrics tracking
  * - Detailed error codes
  * - Message buffering for offline support

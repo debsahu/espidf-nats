@@ -18,6 +18,10 @@ This module is was ported from https://github.com/isobit/arduino-nats and aims t
 - **Request timeouts** - Prevent hanging requests with configurable timeouts
 - **Async/non-blocking API** - connect_async() for better FreeRTOS integration
 - **Comprehensive JetStream support** - Streams, consumers, pull-based delivery, message deduplication, and ACK controls
+- **Key-Value Store** - Distributed configuration and state management with revision history, TTL, and watchers
+- **Ordered Consumers** - Guaranteed in-order message delivery for sequential processing
+- **Fetch Operations** - Efficient batch message retrieval with configurable limits and heartbeats
+- **Account Info** - Monitor JetStream resource usage and quotas
 - **Connection metrics** - Track messages/bytes sent/received, reconnections, and uptime
 - **Error handling** - Detailed error codes with last_error() for diagnostics
 - **Message buffering** - Automatic offline message queuing and replay on reconnect
@@ -403,6 +407,259 @@ nats.jetstream_consumer_delete(
     []() { ESP_LOGW(TAG, "Timeout"); },
     5000
 );
+```
+
+## Advanced JetStream Features
+
+### Ordered Consumers
+
+Guaranteed in-order message delivery for sequential processing:
+
+```c
+// Create ordered consumer (simplified API)
+nats.jetstream_consumer_create_ordered(
+    "ORDERS",           // stream name
+    "orders.new",       // filter subject (optional)
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Consumer created: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+```
+
+**Features:**
+- Ephemeral consumers (no durable name)
+- Server-side flow control and heartbeats
+- Guaranteed in-order delivery
+- Perfect for sequential command execution, firmware updates, time-series data
+
+### Fetch Operations
+
+Efficient batch message retrieval:
+
+```c
+// Configure fetch request
+jetstream_fetch_request_t fetch_config = {
+    .batch = 10,                        // Fetch 10 messages
+    .max_bytes = 1048576,               // Max 1 MB
+    .expires = 5000000000LL,            // 5 second timeout (nanoseconds)
+    .heartbeat = 1000000000LL,          // 1 second heartbeat
+    .no_wait = true                     // Don't wait if no messages
+};
+
+// Fetch messages
+nats.jetstream_fetch(
+    "ORDERS",                           // stream name
+    "order-processor",                  // consumer name
+    &fetch_config,
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Message: %.*s", e.size, e.data);
+        nats.jetstream_ack(e.reply);
+    },
+    []() { ESP_LOGW(TAG, "Fetch timeout"); },
+    5000
+);
+```
+
+**Benefits:**
+- More efficient than individual pulls
+- Reduces protocol overhead
+- Configurable batch size, byte limits, and heartbeats
+- Ideal for batch processing queued messages
+
+### Account Information
+
+Monitor JetStream resource usage and quotas:
+
+```c
+nats.jetstream_account_info(
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Account info: %s", e.data);
+        // Parse JSON response:
+        // {"memory": 1024, "storage": 2048, "streams": 5, "consumers": 10,
+        //  "limits": {"max_memory": 1073741824, "max_storage": 10737418240, ...}}
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+```
+
+**Use Cases:**
+- Monitor ESP32 device quota usage
+- Prevent resource exhaustion
+- Warn before hitting limits
+- Capacity planning for IoT fleet
+
+## Key-Value Store
+
+Distributed key-value storage built on JetStream for device configuration and state management.
+
+### Creating a KV Bucket
+
+```c
+kv_config_t kv_config = {
+    .bucket = "device-config",
+    .description = "Device configuration",
+    .max_value_size = 1024,             // 1 KB max value
+    .history = 10,                      // Keep 10 revisions per key
+    .ttl = 0,                           // No expiration
+    .storage = "file",                  // File storage
+    .replicas = 1,
+    .max_bytes = 10485760               // 10 MB bucket limit
+};
+
+nats.kv_create_bucket(
+    &kv_config,
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Bucket created: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+```
+
+### Putting and Getting Values
+
+```c
+// Put a value
+nats.kv_put(
+    "device-config",                    // bucket name
+    "wifi_ssid",                        // key
+    "MyNetwork",                        // value
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Value stored: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+
+// Get a value
+nats.kv_get(
+    "device-config",                    // bucket name
+    "wifi_ssid",                        // key
+    [](NATS::msg e) {
+        // Parse JSON response to extract value
+        ESP_LOGI(TAG, "Got value: %.*s", e.size, e.data);
+    },
+    []() { ESP_LOGW(TAG, "Key not found or timeout"); },
+    5000
+);
+```
+
+### Watching for Changes
+
+Watch a key or key pattern for real-time updates:
+
+```c
+// Watch specific key
+nats.kv_watch(
+    "device-config",
+    "wifi_ssid",
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Config changed: %.*s", e.size, e.data);
+        // Automatically reload configuration
+    }
+);
+
+// Watch all keys in bucket (wildcard)
+nats.kv_watch(
+    "device-config",
+    "*",                                // All keys
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Any config changed: %s", e.subject);
+    }
+);
+```
+
+### Deleting and Purging Keys
+
+```c
+// Soft delete (preserves history with tombstone)
+nats.kv_delete(
+    "device-config",
+    "old_key",
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Key deleted (soft): %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+
+// Hard delete (purge all revisions)
+nats.kv_purge(
+    "device-config",
+    "old_key",
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Key purged (hard): %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+```
+
+### Getting Key History
+
+```c
+// Get all revisions of a key
+nats.kv_history(
+    "device-config",
+    "wifi_ssid",
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Revision: %.*s", e.size, e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+```
+
+### Listing All Keys
+
+```c
+nats.kv_keys(
+    "device-config",
+    [](NATS::msg e) {
+        // Parse JSON response for key list
+        ESP_LOGI(TAG, "Keys: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+```
+
+### KV Store Use Cases for IoT
+
+**Device Configuration:**
+```c
+// Store WiFi credentials
+nats.kv_put("device-config", "wifi_ssid", "MyNetwork", ...);
+nats.kv_put("device-config", "wifi_password", "secret123", ...);
+
+// Store sensor calibration
+nats.kv_put("sensors", "temp_offset", "2.5", ...);
+nats.kv_put("sensors", "humidity_cal", "1.02", ...);
+```
+
+**Device Twin/Shadow State:**
+```c
+// Update device state
+nats.kv_put("device-state", "temperature", "25.5", ...);
+nats.kv_put("device-state", "status", "online", ...);
+
+// Watch for desired state changes from cloud
+nats.kv_watch("device-state", "desired_temp", [](NATS::msg e) {
+    // Update thermostat setpoint
+});
+```
+
+**Remote Configuration Updates:**
+```c
+// Watch for config updates from server
+nats.kv_watch("device-config", "*", [](NATS::msg e) {
+    ESP_LOGI(TAG, "Config updated remotely: %s", e.subject);
+    // Reload configuration without reboot
+    reload_config();
+});
 ```
 
 ## Reliability Features
