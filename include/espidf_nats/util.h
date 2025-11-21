@@ -65,15 +65,33 @@ namespace NATSUtil {
         private:
             void resize() {
                 if (cap == 0) cap = 1;
-                else cap *= 2;
-                data = (T*)realloc(data, cap * sizeof(T));
+                else {
+                    // Check for overflow before doubling capacity
+                    if (cap > SIZE_MAX / (2 * sizeof(T))) {
+                        // Would overflow - keep current capacity
+                        ESP_LOGE("Array", "Array resize would overflow, keeping current size");
+                        return;
+                    }
+                    cap *= 2;
+                }
+
+                T* new_data = (T*)realloc(data, cap * sizeof(T));
+                if (new_data == NULL) {
+                    // Realloc failed - restore old capacity and keep old data
+                    ESP_LOGE("Array", "Failed to resize array from %zu to %zu elements", len, cap);
+                    cap /= 2;  // Restore old capacity
+                    if (cap == 0) cap = 1;
+                    return;
+                }
+                data = new_data;
             }
 
         public:
             size_t size() const { return len; }
 
             void erase(size_t idx) {
-                for (size_t i = idx; i < len; i++) {
+                if (idx >= len) return;  // Bounds check
+                for (size_t i = idx; i < len - 1; i++) {
                     data[i] = data[i+1];
                 }
                 len--;

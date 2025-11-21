@@ -54,7 +54,9 @@ typedef enum {
     NATS_ERR_MAX_PINGS_EXCEEDED,       // Too many outstanding pings
     NATS_ERR_DISCONNECTED,             // Disconnected from server
     NATS_ERR_INVALID_SUBJECT,          // Invalid subject name
-    NATS_ERR_NOT_CONNECTED             // Operation requires connection
+    NATS_ERR_NOT_CONNECTED,            // Operation requires connection
+    NATS_ERR_INVALID_CONFIG,           // Invalid configuration
+    NATS_ERR_OUT_OF_MEMORY             // Out of memory
 } nats_error_code_t;
 
 /**

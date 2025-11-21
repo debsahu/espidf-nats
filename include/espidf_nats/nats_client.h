@@ -61,7 +61,8 @@ class NATS {
         nats_connection_metrics_t metrics;
         nats_error_code_t last_error_code;
         bool draining;
-        SemaphoreHandle_t mutex;
+        SemaphoreHandle_t mutex;          // Protects data structures (subs, pending_messages)
+        SemaphoreHandle_t io_mutex;       // Protects TLS/socket I/O operations
 
     public:
         bool connected;
@@ -114,6 +115,19 @@ class NATS {
                 last_error_code = NATS_ERR_NONE;
                 draining = false;
                 mutex = xSemaphoreCreateMutex();
+                io_mutex = xSemaphoreCreateMutex();
+                if (mutex == NULL || io_mutex == NULL) {
+                    ESP_LOGE(tag, "Failed to create mutex - out of memory");
+                    last_error_code = NATS_ERR_OUT_OF_MEMORY;
+                    if (mutex != NULL) vSemaphoreDelete(mutex);
+                    if (io_mutex != NULL) vSemaphoreDelete(io_mutex);
+                    mutex = io_mutex = NULL;
+                } else {
+                    // Validate TLS configuration if provided
+                    if (!validate_tls_config()) {
+                        ESP_LOGE(tag, "Invalid TLS configuration in constructor");
+                    }
+                }
             }
 
         // Multiple servers constructor with failover
@@ -159,6 +173,19 @@ class NATS {
                 last_error_code = NATS_ERR_NONE;
                 draining = false;
                 mutex = xSemaphoreCreateMutex();
+                io_mutex = xSemaphoreCreateMutex();
+                if (mutex == NULL || io_mutex == NULL) {
+                    ESP_LOGE(tag, "Failed to create mutex - out of memory");
+                    last_error_code = NATS_ERR_OUT_OF_MEMORY;
+                    if (mutex != NULL) vSemaphoreDelete(mutex);
+                    if (io_mutex != NULL) vSemaphoreDelete(io_mutex);
+                    mutex = io_mutex = NULL;
+                } else {
+                    // Validate TLS configuration if provided
+                    if (!validate_tls_config()) {
+                        ESP_LOGE(tag, "Invalid TLS configuration in constructor");
+                    }
+                }
             }
 
         // Destructor to cleanup resources
@@ -188,22 +215,69 @@ class NATS {
                 }
                 xSemaphoreGive(mutex);
 
-                // Delete the mutex
+                // Delete the mutexes
                 vSemaphoreDelete(mutex);
                 mutex = NULL;
+                if (io_mutex != NULL) {
+                    vSemaphoreDelete(io_mutex);
+                    io_mutex = NULL;
+                }
             }
         }
 
     private:
+        bool validate_tls_config() {
+            if (!tls_config.enabled) {
+                return true;  // No validation needed if TLS is disabled
+            }
+
+            // If TLS is enabled and certificate verification is not skipped, CA cert must be provided
+            if (!tls_config.skip_cert_verification) {
+                if (tls_config.ca_cert == NULL || tls_config.ca_cert_len == 0) {
+                    ESP_LOGE(tag, "TLS enabled with cert verification but no CA certificate provided");
+                    last_error_code = NATS_ERR_INVALID_CONFIG;
+                    return false;
+                }
+            }
+
+            // If client cert is provided, client key must also be provided (and vice versa)
+            if ((tls_config.client_cert != NULL) != (tls_config.client_key != NULL)) {
+                ESP_LOGE(tag, "TLS client cert and key must both be provided or both be NULL");
+                last_error_code = NATS_ERR_INVALID_CONFIG;
+                return false;
+            }
+
+            // If client cert is provided, validate lengths
+            if (tls_config.client_cert != NULL) {
+                if (tls_config.client_cert_len == 0 || tls_config.client_key_len == 0) {
+                    ESP_LOGE(tag, "TLS client cert/key provided but length is zero");
+                    last_error_code = NATS_ERR_INVALID_CONFIG;
+                    return false;
+                }
+            }
+
+            // Warn if server_name is not set (SNI won't work properly)
+            if (tls_config.server_name == NULL && !tls_config.skip_cert_verification) {
+                ESP_LOGW(tag, "TLS enabled without server_name - SNI will use hostname from connection");
+            }
+
+            return true;
+        }
+
         void send(const char* msg) {
             if (msg == NULL) return;
             size_t len = strlen(msg);
             ssize_t ret;
+
+            // Protect TLS/socket I/O operations with io_mutex
+            if (io_mutex != NULL) xSemaphoreTake(io_mutex, portMAX_DELAY);
+
             if (tls_config.enabled && tls != NULL) {
                 ret = esp_tls_conn_write(tls, msg, len);
                 if (ret < 0 || (size_t)ret != len) {
                     ESP_LOGE(tag, "TLS write failed: %d", (int)ret);
                     last_error_code = NATS_ERR_SOCKET_FAILED;
+                    if (io_mutex != NULL) xSemaphoreGive(io_mutex);
                     disconnect();
                     return;
                 }
@@ -211,15 +285,20 @@ class NATS {
                 if (ret < 0) {
                     ESP_LOGE(tag, "TLS write CRLF failed: %d", (int)ret);
                     last_error_code = NATS_ERR_SOCKET_FAILED;
+                    if (io_mutex != NULL) xSemaphoreGive(io_mutex);
                     disconnect();
                     return;
                 }
             } else {
-                if (sockfd < 0) return;
+                if (sockfd < 0) {
+                    if (io_mutex != NULL) xSemaphoreGive(io_mutex);
+                    return;
+                }
                 ret = ::send(sockfd, msg, len, 0);
                 if (ret < 0) {
                     ESP_LOGE(tag, "Socket send failed: %d", errno);
                     last_error_code = NATS_ERR_SOCKET_FAILED;
+                    if (io_mutex != NULL) xSemaphoreGive(io_mutex);
                     disconnect();
                     return;
                 }
@@ -227,10 +306,13 @@ class NATS {
                 if (ret < 0) {
                     ESP_LOGE(tag, "Socket send CRLF failed: %d", errno);
                     last_error_code = NATS_ERR_SOCKET_FAILED;
+                    if (io_mutex != NULL) xSemaphoreGive(io_mutex);
                     disconnect();
                     return;
                 }
             }
+
+            if (io_mutex != NULL) xSemaphoreGive(io_mutex);
             metrics.bytes_sent += len + strlen(NATS_CR_LF);
         }
 
@@ -284,6 +366,10 @@ class NATS {
             int i = 0;
             char c;
             int ret;
+
+            // Protect TLS/socket I/O operations with io_mutex
+            if (io_mutex != NULL) xSemaphoreTake(io_mutex, portMAX_DELAY);
+
             while (true) {
                 if (tls_config.enabled && tls != NULL) {
                     ret = esp_tls_conn_read(tls, &c, 1);
@@ -296,16 +382,27 @@ class NATS {
                         ESP_LOGE(tag, "Read error: %d", ret);
                         last_error_code = NATS_ERR_SOCKET_FAILED;
                     }
+                    if (io_mutex != NULL) xSemaphoreGive(io_mutex);
                     free(buf);
                     disconnect();
                     return (char*)calloc(1, sizeof(char)); // Return empty string
                 }
                 if (c == '\r') continue;
                 if (c == '\n') break;
-                if (i >= cap) {
-                    char* newbuf = (char*)realloc(buf, (cap *= 2) * sizeof(char) + 1);
+                if (i >= cap - 1) {  // Leave room for null terminator
+                    // Check for overflow before doubling capacity
+                    if (cap > SIZE_MAX / 2) {
+                        ESP_LOGE(tag, "Readline buffer too large");
+                        if (io_mutex != NULL) xSemaphoreGive(io_mutex);
+                        free(buf);
+                        disconnect();
+                        return (char*)calloc(1, sizeof(char));
+                    }
+                    cap *= 2;
+                    char* newbuf = (char*)realloc(buf, cap + 1);  // +1 for null terminator
                     if (newbuf == NULL) {
                         ESP_LOGE(tag, "Failed to realloc readline buffer");
+                        if (io_mutex != NULL) xSemaphoreGive(io_mutex);
                         free(buf);
                         disconnect();
                         return (char*)calloc(1, sizeof(char));
@@ -314,6 +411,8 @@ class NATS {
                 }
                 buf[i++] = c;
             }
+
+            if (io_mutex != NULL) xSemaphoreGive(io_mutex);
             buf[i] = '\0';
             return buf;
         }
@@ -362,21 +461,25 @@ class NATS {
                 metrics.msgs_received++;
                 metrics.bytes_received += payload_size;
 
-                // Get callback without holding mutex for long
+                // Get callback and cache maxed check without holding mutex for long
                 xSemaphoreTake(mutex, portMAX_DELAY);
                 Sub* sub = subs[sid];
+                bool will_max_out = false;
+                if (sub != NULL) {
+                    // Cache whether this will max out BEFORE calling callback
+                    // to avoid race condition where sub could be deleted
+                    will_max_out = (sub->max_wanted > 0 && sub->received + 1 >= sub->max_wanted);
+                }
                 xSemaphoreGive(mutex);
 
                 if (sub != NULL) {
                     // Call user callback WITHOUT holding mutex to prevent deadlock
                     sub->call(e);
 
-                    // Check if we should unsubscribe
-                    xSemaphoreTake(mutex, portMAX_DELAY);
-                    bool should_unsub = (subs[sid] != NULL && subs[sid]->maxed());
-                    xSemaphoreGive(mutex);
-
-                    if (should_unsub) unsubscribe(sid);
+                    // Unsubscribe if we cached that it would max out
+                    if (will_max_out) {
+                        unsubscribe(sid);
+                    }
                 }
                 free(payload_buf);
             }
@@ -405,6 +508,12 @@ class NATS {
                 // Check for integer overflow
                 if (total_size < 0 || total_size > INT_MAX - 1) { free(buf); return; }
                 total_size += 1;
+                // Validate that header_size doesn't exceed total_size (malicious server protection)
+                if (header_size < 0 || header_size > total_size) {
+                    ESP_LOGE(tag, "Invalid message sizes: header=%d, total=%d", header_size, total_size);
+                    free(buf);
+                    return;
+                }
                 int data_size = total_size - header_size;
 
                 char* full_buf = client_readline(total_size);
@@ -423,21 +532,25 @@ class NATS {
                 metrics.msgs_received++;
                 metrics.bytes_received += total_size;
 
-                // Get callback without holding mutex for long
+                // Get callback and cache maxed check without holding mutex for long
                 xSemaphoreTake(mutex, portMAX_DELAY);
                 Sub* sub = subs[sid];
+                bool will_max_out = false;
+                if (sub != NULL) {
+                    // Cache whether this will max out BEFORE calling callback
+                    // to avoid race condition where sub could be deleted
+                    will_max_out = (sub->max_wanted > 0 && sub->received + 1 >= sub->max_wanted);
+                }
                 xSemaphoreGive(mutex);
 
                 if (sub != NULL) {
                     // Call user callback WITHOUT holding mutex to prevent deadlock
                     sub->call(e);
 
-                    // Check if we should unsubscribe
-                    xSemaphoreTake(mutex, portMAX_DELAY);
-                    bool should_unsub = (subs[sid] != NULL && subs[sid]->maxed());
-                    xSemaphoreGive(mutex);
-
-                    if (should_unsub) unsubscribe(sid);
+                    // Unsubscribe if we cached that it would max out
+                    if (will_max_out) {
+                        unsubscribe(sid);
+                    }
                 }
                 free(full_buf);
             }
@@ -504,7 +617,11 @@ class NATS {
             }
 
             // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (max)
-            unsigned long delay = NATS_RECONNECT_INTERVAL * (1 << reconnect_attempts);
+            // Prevent overflow by capping reconnect_attempts
+            if (reconnect_attempts >= 30) {
+                return NATS_MAX_RECONNECT_DELAY;
+            }
+            unsigned long delay = NATS_RECONNECT_INTERVAL * (1UL << reconnect_attempts);
             if (delay > NATS_MAX_RECONNECT_DELAY) {
                 delay = NATS_MAX_RECONNECT_DELAY;
             }
@@ -543,9 +660,22 @@ class NATS {
         }
 
         void send_pending_messages() {
-            while (!pending_messages.empty()) {
-                pending_msg_t pmsg = pending_messages.pop();
+            // Process messages one at a time to avoid holding mutex during publish
+            while (true) {
+                pending_msg_t pmsg = {};
+                bool has_message = false;
 
+                // Pop message with mutex protection
+                xSemaphoreTake(mutex, portMAX_DELAY);
+                if (!pending_messages.empty()) {
+                    pmsg = pending_messages.pop();
+                    has_message = true;
+                }
+                xSemaphoreGive(mutex);
+
+                if (!has_message) break;
+
+                // Publish without holding mutex (to avoid deadlock if publish fails and calls disconnect)
                 if (pmsg.headers != NULL) {
                     publish_with_headers(pmsg.subject, pmsg.headers, pmsg.message, pmsg.reply_to);
                 } else {
@@ -557,6 +687,9 @@ class NATS {
                 if (pmsg.message != NULL) free(pmsg.message);
                 if (pmsg.reply_to != NULL) free(pmsg.reply_to);
                 if (pmsg.headers != NULL) free(pmsg.headers);
+
+                // Check if still connected after each publish
+                if (!connected) break;
             }
         }
 
@@ -714,14 +847,35 @@ class NATS {
             if (mutex != NULL) {
                 if (xSemaphoreTake(mutex, 0) == pdTRUE) {
                     // We got the mutex, so we weren't holding it
+                    // Delete all Sub objects before clearing array
+                    for (size_t i = 0; i < subs.size(); i++) {
+                        if (subs[i] != NULL) {
+                            delete subs[i];
+                            subs[i] = NULL;
+                        }
+                    }
                     subs.empty();
                     xSemaphoreGive(mutex);
                 } else {
                     // Mutex might be held by us already (recursive call from send() etc.)
                     // Just clear without mutex in this case
+                    // Delete all Sub objects before clearing array
+                    for (size_t i = 0; i < subs.size(); i++) {
+                        if (subs[i] != NULL) {
+                            delete subs[i];
+                            subs[i] = NULL;
+                        }
+                    }
                     subs.empty();
                 }
             } else {
+                // Delete all Sub objects before clearing array
+                for (size_t i = 0; i < subs.size(); i++) {
+                    if (subs[i] != NULL) {
+                        delete subs[i];
+                        subs[i] = NULL;
+                    }
+                }
                 subs.empty();
             }
 
@@ -734,10 +888,11 @@ class NATS {
                 buffer_message(subject, msg, replyto, NULL);
                 return;
             }
+            size_t msg_len = (msg == NULL) ? 0 : strlen(msg);
             send_fmt("PUB %s %s %lu",
                     subject,
                     (replyto == NULL)? "" : replyto,
-                    (unsigned long)strlen(msg));
+                    (unsigned long)msg_len);
             send((msg == NULL)? "" : msg);
             metrics.msgs_sent++;
         }
@@ -893,6 +1048,8 @@ class NATS {
                 case NATS_ERR_DISCONNECTED: return "Disconnected";
                 case NATS_ERR_INVALID_SUBJECT: return "Invalid subject";
                 case NATS_ERR_NOT_CONNECTED: return "Not connected";
+                case NATS_ERR_INVALID_CONFIG: return "Invalid configuration";
+                case NATS_ERR_OUT_OF_MEMORY: return "Out of memory";
                 default: return "Unknown error";
             }
         }
