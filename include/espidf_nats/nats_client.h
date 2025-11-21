@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <limits.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -12,6 +13,8 @@
 #include <unistd.h>
 #include <esp_log.h>
 #include <esp_tls.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "config.h"
 #include "util.h"
 #include "types.h"
@@ -26,48 +29,13 @@ class NATS {
         typedef nats_msg_t msg;
 
     private:
-        typedef struct {
-            char* subject;
-            char* message;
-            char* reply_to;
-            char* headers;
-        } pending_msg_t;
-        typedef void (*sub_cb)(msg e);
-        typedef void (*event_cb)();
-        typedef void (*timeout_cb)();
-        typedef void (*connect_cb)(bool success);
-
+        // Use types from types.h and subscription.h instead of duplicating
         enum ConnectState {
             DISCONNECTED,
             CONNECTING,
             CONNECTED
         };
 
-        class Sub {
-            public:
-            sub_cb cb;
-            int received;
-            int max_wanted;
-            unsigned long timeout_ms;
-            unsigned long request_time;
-            timeout_cb on_timeout;
-            Sub(sub_cb cb, int max_wanted = 0, unsigned long timeout_ms = 0, timeout_cb on_timeout = NULL) :
-                cb(cb), received(0), max_wanted(max_wanted),
-                timeout_ms(timeout_ms), request_time(NATSUtil::millis()), on_timeout(on_timeout) {}
-            void call(msg& e) {
-                received++;
-                cb(e);
-            }
-            bool maxed() {
-                return (max_wanted == 0)? false : received >= max_wanted;
-            }
-            bool timed_out() {
-                if (timeout_ms == 0) return false;
-                return (NATSUtil::millis() - request_time) > timeout_ms;
-            }
-        };
-
-    private:
         int sockfd;
         esp_tls_t* tls;
         nats_tls_config_t tls_config;
@@ -93,6 +61,7 @@ class NATS {
         nats_connection_metrics_t metrics;
         nats_error_code_t last_error_code;
         bool draining;
+        SemaphoreHandle_t mutex;
 
     public:
         bool connected;
@@ -144,6 +113,7 @@ class NATS {
                 memset(&metrics, 0, sizeof(nats_connection_metrics_t));
                 last_error_code = NATS_ERR_NONE;
                 draining = false;
+                mutex = xSemaphoreCreateMutex();
             }
 
         // Multiple servers constructor with failover
@@ -188,19 +158,74 @@ class NATS {
                 memset(&metrics, 0, sizeof(nats_connection_metrics_t));
                 last_error_code = NATS_ERR_NONE;
                 draining = false;
+                mutex = xSemaphoreCreateMutex();
             }
+
+        // Destructor to cleanup resources
+        ~NATS() {
+            // Disconnect if still connected
+            if (connected) {
+                disconnect();
+            }
+
+            // Clean up all subscriptions
+            if (mutex != NULL) {
+                xSemaphoreTake(mutex, portMAX_DELAY);
+                for (size_t i = 0; i < subs.size(); i++) {
+                    if (subs[i] != NULL) {
+                        delete subs[i];
+                        subs[i] = NULL;
+                    }
+                }
+
+                // Clean up pending messages
+                while (!pending_messages.empty()) {
+                    pending_msg_t pmsg = pending_messages.pop();
+                    if (pmsg.subject != NULL) free(pmsg.subject);
+                    if (pmsg.message != NULL) free(pmsg.message);
+                    if (pmsg.reply_to != NULL) free(pmsg.reply_to);
+                    if (pmsg.headers != NULL) free(pmsg.headers);
+                }
+                xSemaphoreGive(mutex);
+
+                // Delete the mutex
+                vSemaphoreDelete(mutex);
+                mutex = NULL;
+            }
+        }
 
     private:
         void send(const char* msg) {
             if (msg == NULL) return;
             size_t len = strlen(msg);
+            ssize_t ret;
             if (tls_config.enabled && tls != NULL) {
-                esp_tls_conn_write(tls, msg, len);
-                esp_tls_conn_write(tls, NATS_CR_LF, strlen(NATS_CR_LF));
+                ret = esp_tls_conn_write(tls, msg, len);
+                if (ret < 0) {
+                    last_error_code = NATS_ERR_SOCKET_FAILED;
+                    disconnect();
+                    return;
+                }
+                ret = esp_tls_conn_write(tls, NATS_CR_LF, strlen(NATS_CR_LF));
+                if (ret < 0) {
+                    last_error_code = NATS_ERR_SOCKET_FAILED;
+                    disconnect();
+                    return;
+                }
             } else {
                 if (sockfd < 0) return;
-                ::send(sockfd, msg, len, 0);
-                ::send(sockfd, NATS_CR_LF, strlen(NATS_CR_LF), 0);
+                ret = ::send(sockfd, msg, len, 0);
+                if (ret < 0) {
+                    last_error_code = NATS_ERR_SOCKET_FAILED;
+                    disconnect();
+                    return;
+                }
+                ret = ::send(sockfd, NATS_CR_LF, strlen(NATS_CR_LF), 0);
+                if (ret < 0) {
+                    last_error_code = NATS_ERR_SOCKET_FAILED;
+                    disconnect();
+                    return;
+                }
             }
             metrics.bytes_sent += len + strlen(NATS_CR_LF);
         }
@@ -256,7 +281,15 @@ class NATS {
                 } else {
                     ret = ::recv(sockfd, &c, 1, 0);
                 }
-                if (ret != 1) break;
+                if (ret <= 0) {
+                    // Connection error or closed
+                    if (ret < 0) {
+                        last_error_code = NATS_ERR_SOCKET_FAILED;
+                    }
+                    free(buf);
+                    disconnect();
+                    return (char*)calloc(1, sizeof(char)); // Return empty string
+                }
                 if (c == '\r') continue;
                 if (c == '\n') break;
                 if (i >= cap) buf = (char*)realloc(buf, (cap *= 2) * sizeof(char) + 1);
@@ -278,9 +311,25 @@ class NATS {
             if (argc == 0) {}
             if (strcmp(argv[0], NATS_CTRL_MSG) == 0) {
                 if (argc != 4 && argc != 5) { free(buf); return; }
-                int sid = atoi(argv[2]);
-                if (subs[sid] == NULL) { free(buf); return; };
-                int payload_size = atoi((argc == 5)? argv[4] : argv[3]) + 1;
+                char* endptr;
+                long sid_long = strtol(argv[2], &endptr, 10);
+                if (*endptr != '\0' || sid_long < 0 || sid_long > INT_MAX) { free(buf); return; }
+                int sid = (int)sid_long;
+                // Validate SID bounds (check with mutex)
+                xSemaphoreTake(mutex, portMAX_DELAY);
+                if (sid < 0 || sid >= subs.size() || subs[sid] == NULL) {
+                    xSemaphoreGive(mutex);
+                    free(buf);
+                    return;
+                };
+                xSemaphoreGive(mutex);
+
+                long payload_size_long = strtol((argc == 5)? argv[4] : argv[3], &endptr, 10);
+                if (*endptr != '\0' || payload_size_long < 0 || payload_size_long > INT_MAX) { free(buf); return; }
+                int payload_size = (int)payload_size_long;
+                // Check for integer overflow
+                if (payload_size < 0 || payload_size > INT_MAX - 1) { free(buf); return; }
+                payload_size += 1;
                 char* payload_buf = client_readline(payload_size);
                 msg e = {
                     argv[1],
@@ -293,18 +342,50 @@ class NATS {
                 };
                 metrics.msgs_received++;
                 metrics.bytes_received += payload_size;
-                subs[sid]->call(e);
-                if (subs[sid]->maxed()) unsubscribe(sid);
+
+                // Get callback without holding mutex for long
+                xSemaphoreTake(mutex, portMAX_DELAY);
+                Sub* sub = subs[sid];
+                xSemaphoreGive(mutex);
+
+                if (sub != NULL) {
+                    // Call user callback WITHOUT holding mutex to prevent deadlock
+                    sub->call(e);
+
+                    // Check if we should unsubscribe
+                    xSemaphoreTake(mutex, portMAX_DELAY);
+                    bool should_unsub = (subs[sid] != NULL && subs[sid]->maxed());
+                    xSemaphoreGive(mutex);
+
+                    if (should_unsub) unsubscribe(sid);
+                }
                 free(payload_buf);
             }
             else if (strcmp(argv[0], NATS_CTRL_HMSG) == 0) {
                 // HMSG <subject> <sid> [reply-to] <header bytes> <total bytes>
                 if (argc != 5 && argc != 6) { free(buf); return; }
-                int sid = atoi(argv[2]);
-                if (subs[sid] == NULL) { free(buf); return; };
+                char* endptr;
+                long sid_long = strtol(argv[2], &endptr, 10);
+                if (*endptr != '\0' || sid_long < 0 || sid_long > INT_MAX) { free(buf); return; }
+                int sid = (int)sid_long;
+                // Validate SID bounds (check with mutex)
+                xSemaphoreTake(mutex, portMAX_DELAY);
+                if (sid < 0 || sid >= subs.size() || subs[sid] == NULL) {
+                    xSemaphoreGive(mutex);
+                    free(buf);
+                    return;
+                };
+                xSemaphoreGive(mutex);
 
-                int header_size = atoi((argc == 6)? argv[4] : argv[3]);
-                int total_size = atoi((argc == 6)? argv[5] : argv[4]) + 1;
+                long header_size_long = strtol((argc == 6)? argv[4] : argv[3], &endptr, 10);
+                if (*endptr != '\0' || header_size_long < 0 || header_size_long > INT_MAX) { free(buf); return; }
+                int header_size = (int)header_size_long;
+                long total_size_long = strtol((argc == 6)? argv[5] : argv[4], &endptr, 10);
+                if (*endptr != '\0' || total_size_long < 0 || total_size_long > INT_MAX) { free(buf); return; }
+                int total_size = (int)total_size_long;
+                // Check for integer overflow
+                if (total_size < 0 || total_size > INT_MAX - 1) { free(buf); return; }
+                total_size += 1;
                 int data_size = total_size - header_size;
 
                 char* full_buf = client_readline(total_size);
@@ -322,8 +403,23 @@ class NATS {
                 };
                 metrics.msgs_received++;
                 metrics.bytes_received += total_size;
-                subs[sid]->call(e);
-                if (subs[sid]->maxed()) unsubscribe(sid);
+
+                // Get callback without holding mutex for long
+                xSemaphoreTake(mutex, portMAX_DELAY);
+                Sub* sub = subs[sid];
+                xSemaphoreGive(mutex);
+
+                if (sub != NULL) {
+                    // Call user callback WITHOUT holding mutex to prevent deadlock
+                    sub->call(e);
+
+                    // Check if we should unsubscribe
+                    xSemaphoreTake(mutex, portMAX_DELAY);
+                    bool should_unsub = (subs[sid] != NULL && subs[sid]->maxed());
+                    xSemaphoreGive(mutex);
+
+                    if (should_unsub) unsubscribe(sid);
+                }
                 free(full_buf);
             }
             else if (strcmp(argv[0], NATS_CTRL_OK) == 0) {
@@ -394,6 +490,24 @@ class NATS {
             pmsg.message = (msg != NULL) ? strdup(msg) : NULL;
             pmsg.reply_to = (replyto != NULL) ? strdup(replyto) : NULL;
             pmsg.headers = (headers != NULL) ? strdup(headers) : NULL;
+
+            // Check for allocation failures
+            if (subject != NULL && pmsg.subject == NULL) return;
+            if (msg != NULL && pmsg.message == NULL) {
+                if (pmsg.subject != NULL) free(pmsg.subject);
+                return;
+            }
+            if (replyto != NULL && pmsg.reply_to == NULL) {
+                if (pmsg.subject != NULL) free(pmsg.subject);
+                if (pmsg.message != NULL) free(pmsg.message);
+                return;
+            }
+            if (headers != NULL && pmsg.headers == NULL) {
+                if (pmsg.subject != NULL) free(pmsg.subject);
+                if (pmsg.message != NULL) free(pmsg.message);
+                if (pmsg.reply_to != NULL) free(pmsg.reply_to);
+                return;
+            }
 
             pending_messages.push(pmsg);
         }
@@ -559,7 +673,22 @@ class NATS {
                 sockfd = -1;
             }
 
-            subs.empty();
+            // Clean up subscriptions with mutex protection
+            // Check if mutex is held by current task to avoid recursive lock
+            if (mutex != NULL) {
+                if (xSemaphoreTake(mutex, 0) == pdTRUE) {
+                    // We got the mutex, so we weren't holding it
+                    subs.empty();
+                    xSemaphoreGive(mutex);
+                } else {
+                    // Mutex might be held by us already (recursive call from send() etc.)
+                    // Just clear without mutex in this case
+                    subs.empty();
+                }
+            } else {
+                subs.empty();
+            }
+
             if (on_disconnect != NULL) on_disconnect();
         }
 
@@ -619,6 +748,8 @@ class NATS {
 
         int subscribe(const char* subject, sub_cb cb, const char* queue = NULL, const int max_wanted = 0) {
             if (!connected) return -1;
+
+            xSemaphoreTake(mutex, portMAX_DELAY);
             Sub* sub = new Sub(cb, max_wanted);
             int sid;
             if (free_sids.empty()) {
@@ -631,15 +762,18 @@ class NATS {
                     subject,
                     (queue == NULL)? "" : queue,
                     sid);
+            xSemaphoreGive(mutex);
             return sid;
         }
 
         void unsubscribe(const int sid) {
             if (!connected) return;
+            xSemaphoreTake(mutex, portMAX_DELAY);
             send_fmt("UNSUB %d", sid);
-            free(subs[sid]);
+            delete subs[sid];  // Fix: Use delete for objects created with new
             subs[sid] = NULL;
             free_sids.push(sid);
+            xSemaphoreGive(mutex);
         }
 
         int request(const char* subject, const char* msg, sub_cb cb, const int max_wanted = 1) {
@@ -657,6 +791,7 @@ class NATS {
             if (!connected) return -1;
             char* inbox = generate_inbox_subject();
 
+            xSemaphoreTake(mutex, portMAX_DELAY);
             Sub* sub = new Sub(cb, max_wanted, timeout_ms, on_timeout);
             int sid;
             if (free_sids.empty()) {
@@ -666,6 +801,7 @@ class NATS {
                 subs[sid] = sub;
             }
             send_fmt("SUB %s %d", inbox, sid);
+            xSemaphoreGive(mutex);
 
             publish(subject, msg, inbox);
             free(inbox);
@@ -773,14 +909,16 @@ class NATS {
             draining = true;
 
             // Unsubscribe from all subscriptions
+            xSemaphoreTake(mutex, portMAX_DELAY);
             for (size_t i = 0; i < subs.size(); i++) {
                 if (subs[i] != NULL) {
                     send_fmt("UNSUB %d", i);
-                    free(subs[i]);
+                    delete subs[i];  // Fix: Use delete for objects created with new
                     subs[i] = NULL;
                     free_sids.push(i);
                 }
             }
+            xSemaphoreGive(mutex);
 
             // Flush to ensure all unsubscribes are sent
             flush(timeout_ms);
@@ -831,13 +969,25 @@ class NATS {
                 }
 
                 // Check for request timeouts
+                // Collect timed out subscriptions first to avoid race conditions
+                NATSUtil::Array<int> timed_out_sids;
+                NATSUtil::Array<timeout_cb> timeout_callbacks;
+
+                xSemaphoreTake(mutex, portMAX_DELAY);
                 for (size_t i = 0; i < subs.size(); i++) {
                     if (subs[i] != NULL && subs[i]->timed_out()) {
-                        if (subs[i]->on_timeout != NULL) {
-                            subs[i]->on_timeout();
-                        }
-                        unsubscribe(i);
+                        timed_out_sids.push_back(i);
+                        timeout_callbacks.push_back(subs[i]->on_timeout);
                     }
+                }
+                xSemaphoreGive(mutex);
+
+                // Now process timeouts without holding the mutex
+                for (size_t i = 0; i < timed_out_sids.size(); i++) {
+                    if (timeout_callbacks[i] != NULL) {
+                        timeout_callbacks[i]();
+                    }
+                    unsubscribe(timed_out_sids[i]);
                 }
 
                 if (ping_timer.process())

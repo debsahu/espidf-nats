@@ -104,7 +104,7 @@ namespace NATSUtil {
     };
 
     /**
-     * Simple queue (LIFO stack) for recycling IDs
+     * Simple queue (FIFO) for message buffering and ID recycling
      */
     template <typename T>
     class Queue {
@@ -115,39 +115,59 @@ namespace NATSUtil {
                     Node* next;
                     Node(T data, Node* next = NULL) : data(data), next(next) {}
             };
-            Node* root;
+            Node* head;  // Front of queue (for dequeue)
+            Node* tail;  // Back of queue (for enqueue)
             size_t len;
 
         public:
-            Queue() : root(NULL), len(0) {}
+            Queue() : head(NULL), tail(NULL), len(0) {}
 
             ~Queue() {
                 Node* tmp;
-                Node* n = root;
+                Node* n = head;
                 while (n != NULL) {
                     tmp = n->next;
-                    free(n);
+                    delete n;  // Fix: Use delete for objects created with new
                     n = tmp;
                 }
             }
 
-            bool empty() const { return root == NULL; }
+            bool empty() const { return head == NULL; }
             size_t size() const { return len; }
 
             void push(T data) {
-                root = new Node(data, root);
+                Node* newNode = new Node(data, NULL);
+                if (tail != NULL) {
+                    tail->next = newNode;
+                } else {
+                    head = newNode;
+                }
+                tail = newNode;
                 len++;
             }
 
             T pop() {
-                Node n = *root;
-                free(root);
-                root = n.next;
+                if (head == NULL) {
+                    // Should not happen if caller checks empty()
+                    return T();
+                }
+                Node* oldHead = head;
+                T data = oldHead->data;
+                head = oldHead->next;
+                if (head == NULL) {
+                    tail = NULL;
+                }
+                delete oldHead;  // Fix: Use delete for objects created with new
                 len--;
-                return n.data;
+                return data;
             }
 
-            T peek() { return root->data; }
+            T peek() {
+                if (head != NULL) {
+                    return head->data;
+                }
+                return T();
+            }
     };
 
 }; // namespace NATSUtil
