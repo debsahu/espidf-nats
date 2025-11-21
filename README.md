@@ -24,9 +24,22 @@ This module is was ported from https://github.com/isobit/arduino-nats and aims t
 - **Exponential backoff** - Smart reconnection delays (1s, 2s, 4s, 8s, 16s, 30s max)
 - **Flush and drain** - Graceful shutdown with pending message delivery guarantees
 
-### Manual
+### Installation
 
-Just download [`espidf_nats.h`](https://raw.githubusercontent.com/daed/espidf-nats/master/espidf_nats.h) and include it in your code.
+Just download [`espidf_nats.h`](https://raw.githubusercontent.com/daed/espidf-nats/master/espidf_nats.h) and include it in your code, or clone the entire repository as an ESP-IDF component.
+
+### Library Structure
+
+The library is modularized into separate headers for better maintainability and readability:
+
+- **`include/espidf_nats.h`** - Main header that includes all modules (use this in your code)
+- **`include/espidf_nats/config.h`** - Configuration defines and constants
+- **`include/espidf_nats/util.h`** - Utility classes (Array, Queue, MillisTimer)
+- **`include/espidf_nats/types.h`** - Type definitions (structs, enums)
+- **`include/espidf_nats/subscription.h`** - Subscription management
+- **`include/espidf_nats/nats_client.h`** - Main NATS client class
+
+Simply `#include "espidf_nats.h"` in your code - all modules are included automatically.
 
 ## API
 
