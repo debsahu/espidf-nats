@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <unistd.h>
 #include <esp_log.h>
 #include <esp_random.h>
@@ -144,7 +145,7 @@ namespace NATSUtil {
                 Node* n = root;
                 while (n != NULL) {
                     tmp = n->next;
-                    free(n);
+                    delete n;  // Use delete for objects created with new
                     n = tmp;
                 }
             }
@@ -156,7 +157,7 @@ namespace NATSUtil {
             }
             T pop() {
                 Node n = *root;
-                free(root);
+                delete root;  // Use delete for objects created with new
                 root = n.next;
                 len--;
                 return n.data;
@@ -268,13 +269,34 @@ class NATS {
         void send(const char* msg) {
             if (msg == NULL) return;
             size_t len = strlen(msg);
+            ssize_t ret;
             if (tls_config.enabled && tls != NULL) {
-                esp_tls_conn_write(tls, msg, len);
-                esp_tls_conn_write(tls, NATS_CR_LF, strlen(NATS_CR_LF));
+                ret = esp_tls_conn_write(tls, msg, len);
+                if (ret < 0 || (size_t)ret != len) {
+                    ESP_LOGE(tag, "TLS write failed: %d", (int)ret);
+                    disconnect();
+                    return;
+                }
+                ret = esp_tls_conn_write(tls, NATS_CR_LF, strlen(NATS_CR_LF));
+                if (ret < 0) {
+                    ESP_LOGE(tag, "TLS write CRLF failed: %d", (int)ret);
+                    disconnect();
+                    return;
+                }
             } else {
                 if (sockfd < 0) return;
-                ::send(sockfd, msg, len, 0);
-                ::send(sockfd, NATS_CR_LF, strlen(NATS_CR_LF), 0);
+                ret = ::send(sockfd, msg, len, 0);
+                if (ret < 0) {
+                    ESP_LOGE(tag, "Socket send failed: %d", errno);
+                    disconnect();
+                    return;
+                }
+                ret = ::send(sockfd, NATS_CR_LF, strlen(NATS_CR_LF), 0);
+                if (ret < 0) {
+                    ESP_LOGE(tag, "Socket send CRLF failed: %d", errno);
+                    disconnect();
+                    return;
+                }
             }
         }
 
@@ -320,6 +342,11 @@ class NATS {
 
         char* client_readline(size_t cap = 128) {
             char* buf = (char*)malloc(cap * sizeof(char));
+            if (buf == NULL) {
+                ESP_LOGE(tag, "Failed to allocate readline buffer");
+                disconnect();
+                return (char*)calloc(1, sizeof(char)); // Return empty string
+            }
             int i = 0;
             char c;
             int ret;
@@ -329,10 +356,27 @@ class NATS {
                 } else {
                     ret = ::recv(sockfd, &c, 1, 0);
                 }
-                if (ret != 1) break;
+                if (ret <= 0) {
+                    // Connection closed (0) or error (-1)
+                    if (ret < 0) {
+                        ESP_LOGE(tag, "Read error: %d", ret);
+                    }
+                    free(buf);
+                    disconnect();
+                    return (char*)calloc(1, sizeof(char)); // Return empty string
+                }
                 if (c == '\r') continue;
                 if (c == '\n') break;
-                if (i >= cap) buf = (char*)realloc(buf, (cap *= 2) * sizeof(char) + 1);
+                if (i >= cap) {
+                    char* newbuf = (char*)realloc(buf, (cap *= 2) * sizeof(char) + 1);
+                    if (newbuf == NULL) {
+                        ESP_LOGE(tag, "Failed to realloc readline buffer");
+                        free(buf);
+                        disconnect();
+                        return (char*)calloc(1, sizeof(char));
+                    }
+                    buf = newbuf;
+                }
                 buf[i++] = c;
             }
             buf[i] = '\0';
@@ -398,10 +442,21 @@ class NATS {
         char* generate_inbox_subject() {
             size_t size = strlen(NATS_INBOX_PREFIX) + NATS_INBOX_ID_LENGTH + 1;
             char* buf = (char*)malloc(size);
+            if (buf == NULL) {
+                ESP_LOGE(tag, "Failed to allocate memory for inbox subject");
+                return NULL;
+            }
             strcpy(buf, NATS_INBOX_PREFIX);
             int i;
+            size_t alphanum_len = sizeof(NATSUtil::alphanums) - 1;
             for (i = strlen(NATS_INBOX_PREFIX); i < size - 1; i++) {
-                int random_idx = NATSUtil::random(sizeof(NATSUtil::alphanums) - 1);
+                // Avoid modulo bias by using rejection sampling
+                uint32_t random_val;
+                uint32_t max_valid = (UINT32_MAX / alphanum_len) * alphanum_len;
+                do {
+                    random_val = esp_random();
+                } while (random_val >= max_valid);
+                int random_idx = random_val % alphanum_len;
                 buf[i] = NATSUtil::alphanums[random_idx];
             }
             buf[i] = '\0';
@@ -415,6 +470,8 @@ class NATS {
                 esp_tls_cfg_t cfg = {};
                 cfg.cacert_buf = (const unsigned char*)tls_config.ca_cert;
                 cfg.cacert_bytes = tls_config.ca_cert_len;
+                cfg.timeout_ms = 30000;  // 30 second timeout
+                cfg.non_block = false;    // Use blocking mode for simplicity
 
                 if (tls_config.client_cert != NULL && tls_config.client_key != NULL) {
                     cfg.clientcert_buf = (const unsigned char*)tls_config.client_cert;
@@ -424,7 +481,11 @@ class NATS {
                 }
 
                 if (tls_config.skip_cert_verification) {
-                    cfg.skip_cert_common_name_check = true;
+                    // Skip both CN check and server certificate verification
+                    cfg.skip_common_name = true;
+                    // Note: esp_tls doesn't have skip_server_cert_verify in older versions
+                    // This only skips CN verification, not the full cert chain
+                    ESP_LOGW(tag, "Certificate CN verification disabled (chain still validated)");
                 }
 
                 if (tls_config.server_name != NULL) {
@@ -455,15 +516,36 @@ class NATS {
                 // Non-TLS connection
                 struct sockaddr_in server_addr;
                 sockfd = socket(AF_INET, SOCK_STREAM, 0);
-                if (sockfd < 0) return false;
+                if (sockfd < 0) {
+                    ESP_LOGE(tag, "Failed to create socket");
+                    reconnect_attempts++;
+                    return false;
+                }
+
                 server_addr.sin_family = AF_INET;
                 server_addr.sin_port = htons(port);
-                server_addr.sin_addr.s_addr = inet_addr(hostname);
+
+                // Try to parse as IP address first
+                if (inet_aton(hostname, &server_addr.sin_addr) == 0) {
+                    // Not an IP address, try DNS resolution
+                    struct hostent *he = gethostbyname(hostname);
+                    if (he == NULL) {
+                        ESP_LOGE(tag, "DNS resolution failed for %s", hostname);
+                        close(sockfd);
+                        sockfd = -1;
+                        reconnect_attempts++;
+                        return false;
+                    }
+                    memcpy(&server_addr.sin_addr, he->h_addr_list[0], he->h_length);
+                }
+
                 if (::connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == 0) {
                     outstanding_pings = 0;
                     reconnect_attempts = 0;
                     return true;
                 }
+
+                ESP_LOGE(tag, "Connection failed to %s:%d", hostname, port);
                 close(sockfd);
                 sockfd = -1;
                 reconnect_attempts++;
@@ -542,7 +624,7 @@ class NATS {
         void unsubscribe(const int sid) {
             if (!connected) return;
             send_fmt("UNSUB %d", sid);
-            free(subs[sid]);
+            delete subs[sid];  // Use delete for objects created with new
             subs[sid] = NULL;
             free_sids.push(sid);
         }
@@ -551,6 +633,10 @@ class NATS {
             if (subject == NULL || subject[0] == 0) return -1;
             if (!connected) return -1;
             char* inbox = generate_inbox_subject();
+            if (inbox == NULL) {
+                ESP_LOGE(tag, "Failed to generate inbox subject");
+                return -1;
+            }
             int sid = subscribe(inbox, cb, NULL, max_wanted);
             publish(subject, msg, inbox);
             free(inbox);
@@ -567,8 +653,7 @@ class NATS {
 
                 // For TLS connections, get the underlying socket descriptor
                 if (tls_config.enabled && tls != NULL) {
-                    fd_to_check = esp_tls_get_conn_sockfd(tls);
-                    if (fd_to_check < 0) {
+                    if (esp_tls_get_conn_sockfd(tls, &fd_to_check) != ESP_OK) {
                         disconnect();
                         return;
                     }
