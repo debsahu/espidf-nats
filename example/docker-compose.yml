@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  # Basic NATS server (no TLS)
+  nats-basic:
+    image: nats:latest
+    container_name: nats-basic
+    ports:
+      - "4222:4222"   # Client connections
+      - "8222:8222"   # HTTP monitoring
+      - "6222:6222"   # Cluster connections
+    command:
+      - "--name=nats-basic"
+      - "--http_port=8222"
+      - "--port=4222"
+      - "--cluster_name=nats-cluster"
+      - "--cluster=nats://0.0.0.0:6222"
+    networks:
+      - nats-network
+    restart: unless-stopped
+
+  # NATS server with JetStream enabled
+  nats-jetstream:
+    image: nats:latest
+    container_name: nats-jetstream
+    ports:
+      - "4223:4222"   # Client connections (different port to avoid conflict)
+      - "8223:8222"   # HTTP monitoring
+    command:
+      - "--name=nats-jetstream"
+      - "--http_port=8222"
+      - "--port=4222"
+      - "--jetstream"
+      - "--store_dir=/data"
+    volumes:
+      - nats-jetstream-data:/data
+    networks:
+      - nats-network
+    restart: unless-stopped
+
+  # NATS server with TLS/SSL
+  nats-tls:
+    image: nats:latest
+    container_name: nats-tls
+    ports:
+      - "4224:4222"   # TLS Client connections
+      - "8224:8222"   # HTTP monitoring
+    command:
+      - "-c"
+      - "/config/nats-tls.conf"
+    volumes:
+      - ./docker/certs:/certs:ro
+      - ./docker/nats-tls.conf:/config/nats-tls.conf:ro
+      - nats-tls-data:/data
+    networks:
+      - nats-network
+    restart: unless-stopped
+    depends_on:
+      - generate-certs
+
+  # Helper service to generate test certificates
+  generate-certs:
+    image: alpine:latest
+    container_name: nats-cert-generator
+    volumes:
+      - ./docker/certs:/certs
+      - ./docker/scripts:/scripts:ro
+    command: sh /scripts/generate-certs.sh
+    networks:
+      - nats-network
+
+networks:
+  nats-network:
+    driver: bridge
+
+volumes:
+  nats-jetstream-data:
+    driver: local
+  nats-tls-data:
+    driver: local
