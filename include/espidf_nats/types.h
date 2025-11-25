@@ -56,7 +56,9 @@ typedef enum {
     NATS_ERR_INVALID_SUBJECT,          // Invalid subject name
     NATS_ERR_NOT_CONNECTED,            // Operation requires connection
     NATS_ERR_INVALID_CONFIG,           // Invalid configuration
-    NATS_ERR_OUT_OF_MEMORY             // Out of memory
+    NATS_ERR_INVALID_ARG,              // Invalid argument
+    NATS_ERR_OUT_OF_MEMORY,            // Out of memory
+    NATS_ERR_TOO_MANY_SUBS             // Subscription limit exceeded
 } nats_error_code_t;
 
 /**
@@ -161,5 +163,41 @@ typedef struct {
     bool meta_only;                    // Only metadata, no values
     int64_t updates_only;              // Only updates after revision N
 } kv_watch_options_t;
+
+/**
+ * Object Store bucket configuration
+ */
+typedef struct {
+    const char* bucket;                // Bucket name
+    const char* description;           // Bucket description (optional)
+    int64_t ttl;                       // Time-to-live for objects in nanoseconds (0 = unlimited)
+    const char* storage;               // "file" or "memory"
+    int replicas;                      // Number of replicas (1-5)
+    size_t max_bytes;                  // Maximum total bytes for bucket (0 = unlimited)
+    bool compressed;                   // Enable compression (not implemented in this version)
+} object_store_config_t;
+
+/**
+ * Object metadata
+ */
+typedef struct {
+    const char* bucket;                // Bucket name
+    const char* name;                  // Object name
+    const char* description;           // Object description (optional)
+    size_t size;                       // Total object size in bytes
+    uint64_t chunks;                   // Number of chunks
+    const char* digest;                // SHA-256 digest (optional)
+    uint64_t mtime;                    // Modified time (nanoseconds)
+} object_meta_t;
+
+/**
+ * Object Store operation status
+ */
+typedef struct {
+    bool success;                      // Operation success
+    const char* name;                  // Object name
+    size_t size;                       // Object size
+    uint64_t nuid;                     // Unique operation ID
+} object_store_status_t;
 
 #endif // ESPIDF_NATS_TYPES_H

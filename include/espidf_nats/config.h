@@ -37,8 +37,15 @@
 #define NATS_INBOX_PREFIX "_INBOX."
 #define NATS_INBOX_ID_LENGTH 22
 
-// Protocol parsing
+// Protocol parsing and limits
 #define NATS_MAX_ARGV 5
+#define NATS_MAX_LINE_SIZE 65536        // Max control line size (64KB)
+#define NATS_MAX_PAYLOAD_SIZE 10485760  // Max message payload (10MB)
+#define NATS_MAX_SUBJECT_LEN 1024       // Max subject length
+#define NATS_MAX_HEADER_LEN 8192        // Max header size (8KB)
+#define NATS_MAX_SUBJECTS 256           // Max subjects in stream config
+#define NATS_MAX_CREDENTIAL_LEN 1024    // Max username/password length
+#define NATS_MAX_SUBSCRIPTIONS 1024     // Max active subscriptions
 
 // Protocol constants
 #define NATS_CR_LF "\r\n"
@@ -50,7 +57,7 @@
 #define NATS_CTRL_PONG "PONG"
 #define NATS_CTRL_INFO "INFO"
 
-// Logging tag
-static const char* tag = "espidf-nats";
+// Logging tag (inline to avoid ODR violations)
+inline const char* tag = "espidf-nats";
 
 #endif // ESPIDF_NATS_CONFIG_H

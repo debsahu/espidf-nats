@@ -15,8 +15,11 @@
  * - Async/non-blocking API
  * - Comprehensive JetStream support (streams, consumers, pull, ACK controls, deduplication)
  * - Key-Value Store (distributed config/state with revision history, TTL, watchers)
+ * - Object Store (large binary storage with automatic 128KB chunking)
  * - Ordered Consumers (guaranteed in-order delivery)
  * - Fetch Operations (efficient batch message retrieval)
+ * - Direct Get (low-latency message retrieval)
+ * - Consumer Pause (flow control and resource management)
  * - Account Info (quota and resource monitoring)
  * - Connection metrics tracking
  * - Detailed error codes

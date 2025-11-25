@@ -19,8 +19,11 @@ This module is was ported from https://github.com/isobit/arduino-nats and aims t
 - **Async/non-blocking API** - connect_async() for better FreeRTOS integration
 - **Comprehensive JetStream support** - Streams, consumers, pull-based delivery, message deduplication, and ACK controls
 - **Key-Value Store** - Distributed configuration and state management with revision history, TTL, and watchers
+- **Object Store** - Large binary storage (firmware, logs, images) with automatic 128KB chunking
 - **Ordered Consumers** - Guaranteed in-order message delivery for sequential processing
 - **Fetch Operations** - Efficient batch message retrieval with configurable limits and heartbeats
+- **Direct Get** - Low-latency JetStream message retrieval bypassing stream leader
+- **Consumer Pause** - Temporary flow control for resource management and maintenance windows
 - **Account Info** - Monitor JetStream resource usage and quotas
 - **Connection metrics** - Track messages/bytes sent/received, reconnections, and uptime
 - **Error handling** - Detailed error codes with last_error() for diagnostics
@@ -49,6 +52,26 @@ Then include in your code:
 ```cpp
 #include "espidf_nats.h"
 ```
+
+### Example Project
+
+A complete working example is available in the `example/` directory. It includes:
+
+- Full ESP-IDF project structure ready to build
+- Docker Compose setup for running a local NATS server
+- Test configurations for basic NATS, JetStream, TLS, and more
+- Makefile with convenient build and flash commands
+
+To try the example:
+
+```bash
+cd example
+idf.py set-target esp32  # or esp32s3, esp32c3, etc.
+idf.py build
+idf.py flash monitor
+```
+
+See `example/README.md` for detailed instructions.
 
 ### Library Structure
 
@@ -662,6 +685,280 @@ nats.kv_watch("device-config", "*", [](NATS::msg e) {
 });
 ```
 
+## Object Store
+
+Store large binary objects (firmware, logs, images) with automatic chunking and efficient retrieval.
+
+### Creating an Object Store Bucket
+
+```c
+object_store_config_t obj_config = {
+    .bucket = "firmware",
+    .description = "Firmware images",
+    .ttl = 86400000000000LL,           // 1 day in nanoseconds
+    .storage = "file",
+    .replicas = 1,
+    .max_bytes = 104857600,            // 100 MB
+    .compressed = false                // Not yet implemented
+};
+
+nats.obj_create_bucket(
+    &obj_config,
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Object store created: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+```
+
+### Storing an Object
+
+Objects are automatically chunked into 128KB pieces for efficient storage:
+
+```c
+// Example: Store firmware image
+uint8_t firmware_data[256000];  // 250 KB firmware
+// ... load firmware data ...
+
+nats.obj_put(
+    "firmware",                        // bucket name
+    "esp32-v1.2.bin",                  // object name
+    firmware_data,                     // data
+    sizeof(firmware_data),             // size
+    "ESP32 firmware v1.2",             // description (optional)
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Firmware stored: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    10000                              // 10 second timeout
+);
+```
+
+### Getting Object Metadata
+
+```c
+nats.obj_get_info(
+    "firmware",
+    "esp32-v1.2.bin",
+    [](NATS::msg e) {
+        // Parse JSON response for metadata
+        ESP_LOGI(TAG, "Object info: %.*s", e.size, e.data);
+        // Response includes: name, size, chunks, nuid, mtime, description
+    },
+    []() { ESP_LOGW(TAG, "Object not found"); },
+    5000
+);
+```
+
+### Downloading an Object
+
+```c
+nats.obj_get(
+    "firmware",
+    "esp32-v1.2.bin",
+    [](NATS::msg e) {
+        // Receive chunks - caller must assemble
+        ESP_LOGI(TAG, "Received chunk: %d bytes", e.size);
+        // Write chunk to flash or buffer
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    30000                              // 30 second timeout for large objects
+);
+```
+
+### Listing Objects in Bucket
+
+```c
+nats.obj_list(
+    "firmware",
+    [](NATS::msg e) {
+        // Parse stream info to extract object list
+        ESP_LOGI(TAG, "Objects: %.*s", e.size, e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+```
+
+### Deleting an Object
+
+```c
+nats.obj_delete(
+    "firmware",
+    "old-version.bin",
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Object deleted: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+```
+
+### Watching for New Objects
+
+Get notified when objects are added or modified:
+
+```c
+nats.obj_watch(
+    "firmware",
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "New object: %s", e.subject);
+        // Download and install new firmware
+    }
+);
+```
+
+### Object Store Use Cases for IoT
+
+**Over-the-Air (OTA) Firmware Updates:**
+```c
+// Server uploads new firmware to object store
+// ESP32 watches for new firmware
+nats.obj_watch("firmware", [](NATS::msg e) {
+    ESP_LOGI(TAG, "New firmware available!");
+    // Download and verify firmware
+    // Perform OTA update
+});
+```
+
+**Data Logging:**
+```c
+// Store sensor logs as objects
+uint8_t log_buffer[50000];
+// ... fill log buffer ...
+
+nats.obj_put("logs", "device-123-20250121.log",
+             log_buffer, sizeof(log_buffer),
+             "Daily sensor log", ...);
+```
+
+**Image Storage:**
+```c
+// Store camera snapshots
+uint8_t image_data[65536];  // JPEG image
+nats.obj_put("images", "snapshot-001.jpg",
+             image_data, image_size,
+             "Motion detected", ...);
+```
+
+## Direct Get
+
+Low-latency message retrieval from JetStream streams, bypassing the stream leader for faster access.
+
+### Get Message by Sequence Number
+
+```c
+nats.jetstream_direct_get(
+    "SENSORS",                         // stream name
+    1234,                              // sequence number
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Message: %.*s", e.size, e.data);
+    },
+    []() { ESP_LOGW(TAG, "Message not found"); },
+    5000
+);
+```
+
+### Get Last Message for Subject
+
+```c
+nats.jetstream_direct_get_last(
+    "SENSORS",                         // stream name
+    "sensor.temp.room1",               // subject
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Latest temp: %.*s", e.size, e.data);
+    },
+    []() { ESP_LOGW(TAG, "No messages"); },
+    5000
+);
+```
+
+### Direct Get Use Cases
+
+**Quick Data Lookup:**
+```c
+// Get latest sensor reading without creating a consumer
+nats.jetstream_direct_get_last("SENSORS", "sensor.temp.*", [](NATS::msg e) {
+    // Process latest temperature reading
+});
+```
+
+**Historical Data Access:**
+```c
+// Retrieve specific historical message by sequence
+nats.jetstream_direct_get("EVENTS", historical_seq, [](NATS::msg e) {
+    // Analyze historical event
+});
+```
+
+## Consumer Pause
+
+Temporarily pause message delivery for flow control and resource management.
+
+### Pause Consumer
+
+```c
+// Pause for 30 seconds
+uint64_t pause_duration_ns = 30000000000ULL;  // 30 seconds in nanoseconds
+uint64_t pause_until = (NATSUtil::millis() * 1000000ULL) + pause_duration_ns;
+
+nats.jetstream_consumer_pause(
+    "SENSORS",                         // stream name
+    "my-consumer",                     // consumer name
+    pause_until,                       // pause until timestamp
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Consumer paused: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+```
+
+### Resume Consumer
+
+```c
+nats.jetstream_consumer_resume(
+    "SENSORS",
+    "my-consumer",
+    [](NATS::msg e) {
+        ESP_LOGI(TAG, "Consumer resumed: %s", e.data);
+    },
+    []() { ESP_LOGW(TAG, "Timeout"); },
+    5000
+);
+```
+
+### Consumer Pause Use Cases
+
+**Resource Management:**
+```c
+// Pause consumer during high-priority task
+nats.jetstream_consumer_pause("SENSORS", "data-processor", pause_time, ...);
+
+// Perform critical operation
+perform_ota_update();
+
+// Resume consumer
+nats.jetstream_consumer_resume("SENSORS", "data-processor", ...);
+```
+
+**Rate Limiting:**
+```c
+// Pause consumer when buffer is full
+if (buffer_full) {
+    uint64_t pause_5_sec = (NATSUtil::millis() * 1000000ULL) + 5000000000ULL;
+    nats.jetstream_consumer_pause("EVENTS", "processor", pause_5_sec, ...);
+}
+```
+
+**Scheduled Maintenance:**
+```c
+// Pause during maintenance window
+uint64_t maintenance_end = get_maintenance_window_end();
+nats.jetstream_consumer_pause("LOGS", "analyzer", maintenance_end, ...);
+```
+
 ## Reliability Features
 
 ### Connection Metrics
@@ -703,10 +1000,16 @@ Available error codes:
 - `NATS_ERR_DNS_RESOLUTION_FAILED` - Hostname lookup failed
 - `NATS_ERR_TLS_INIT_FAILED` - TLS initialization failed
 - `NATS_ERR_TLS_CONNECTION_FAILED` - TLS handshake failed
+- `NATS_ERR_SOCKET_FAILED` - Socket operation failed
 - `NATS_ERR_PROTOCOL_ERROR` - NATS protocol error from server
 - `NATS_ERR_MAX_PINGS_EXCEEDED` - Too many outstanding pings
 - `NATS_ERR_DISCONNECTED` - Disconnected from server
+- `NATS_ERR_INVALID_SUBJECT` - Invalid subject name
 - `NATS_ERR_NOT_CONNECTED` - Operation requires connection
+- `NATS_ERR_INVALID_CONFIG` - Invalid configuration
+- `NATS_ERR_INVALID_ARG` - Invalid argument
+- `NATS_ERR_OUT_OF_MEMORY` - Memory allocation failed
+- `NATS_ERR_TOO_MANY_SUBS` - Subscription limit exceeded
 
 ### Message Buffering
 

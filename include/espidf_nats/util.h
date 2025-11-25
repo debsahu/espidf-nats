@@ -10,6 +10,28 @@ namespace NATSUtil {
     static const char alphanums[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
     /**
+     * Securely zero memory to prevent credential disclosure
+     * Uses volatile to prevent compiler optimization
+     */
+    inline void secure_zero(void* ptr, size_t len) {
+        if (ptr == NULL || len == 0) return;
+        volatile unsigned char* p = (volatile unsigned char*)ptr;
+        while (len--) {
+            *p++ = 0;
+        }
+    }
+
+    /**
+     * Securely zero a C string before freeing
+     * Prevents credential disclosure from freed memory
+     */
+    inline void secure_free(char* str) {
+        if (str == NULL) return;
+        secure_zero(str, strlen(str));
+        free(str);
+    }
+
+    /**
      * Get current time in milliseconds
      */
     inline unsigned long millis() {
@@ -20,9 +42,22 @@ namespace NATSUtil {
 
     /**
      * Generate random number from 0 to max-1
+     * Uses rejection sampling to avoid modulo bias (Issue #17)
      */
     inline int random(int max) {
-        return esp_random() % max;
+        if (max <= 0) return 0;
+        if (max == 1) return 0;
+
+        // Calculate threshold to reject biased values
+        // We reject values >= (UINT32_MAX - (UINT32_MAX % max) + 1) when that doesn't wrap
+        uint32_t threshold = UINT32_MAX - (UINT32_MAX % (uint32_t)max);
+
+        uint32_t r;
+        do {
+            r = esp_random();
+        } while (r >= threshold);  // Rejection sampling
+
+        return (int)(r % (uint32_t)max);
     }
 
     /**
@@ -105,6 +140,7 @@ namespace NATSUtil {
                 len = 0;
                 cap = 32;
                 free(data);
+                data = NULL;  // Set to NULL before malloc to avoid dangling pointer
                 data = (T*)malloc(cap * sizeof(T));
                 if (data == NULL) {
                     ESP_LOGE("Array", "Failed to allocate array in empty()");
