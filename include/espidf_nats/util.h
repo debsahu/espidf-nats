@@ -4,6 +4,10 @@
 #include <sys/time.h>
 #include <esp_random.h>
 #include <stdlib.h>
+#include <string.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <esp_log.h>
 
 namespace NATSUtil {
 
@@ -230,6 +234,185 @@ namespace NATSUtil {
                 }
                 return T();
             }
+    };
+
+    /**
+     * Thread-safe ring buffer for WebSocket event bridging
+     *
+     * Used to bridge event-based WebSocket callbacks to the polling-based
+     * NATS client model. The producer (WebSocket event handler) writes
+     * to the buffer, and the consumer (read_line/read_bytes) reads from it.
+     */
+    class RingBuffer {
+    private:
+        static constexpr const char* TAG = "RingBuffer";
+
+        uint8_t* buffer;
+        size_t capacity;
+        volatile size_t head;  // Write position (producer)
+        volatile size_t tail;  // Read position (consumer)
+        SemaphoreHandle_t mutex;
+        SemaphoreHandle_t data_available;  // Signaled when data is written
+
+    public:
+        /**
+         * Create a ring buffer with specified capacity
+         * @param cap Buffer capacity in bytes (default: 8192)
+         */
+        RingBuffer(size_t cap = 8192) : capacity(cap), head(0), tail(0) {
+            buffer = (uint8_t*)malloc(cap);
+            mutex = xSemaphoreCreateMutex();
+            data_available = xSemaphoreCreateBinary();
+
+            if (buffer == NULL || mutex == NULL || data_available == NULL) {
+                ESP_LOGE(TAG, "Failed to allocate resources");
+                if (buffer) { free(buffer); buffer = NULL; }
+                if (mutex) { vSemaphoreDelete(mutex); mutex = NULL; }
+                if (data_available) { vSemaphoreDelete(data_available); data_available = NULL; }
+                capacity = 0;
+            }
+        }
+
+        ~RingBuffer() {
+            if (buffer) free(buffer);
+            if (mutex) vSemaphoreDelete(mutex);
+            if (data_available) vSemaphoreDelete(data_available);
+        }
+
+        /**
+         * Write data to the buffer (producer)
+         * Called from WebSocket event handler (different task context)
+         *
+         * @param data Data to write
+         * @param len Length of data in bytes
+         * @return Number of bytes written
+         */
+        size_t write(const uint8_t* data, size_t len) {
+            if (buffer == NULL || mutex == NULL || len == 0 || data == NULL) return 0;
+
+            xSemaphoreTake(mutex, portMAX_DELAY);
+
+            size_t written = 0;
+            while (written < len) {
+                size_t next_head = (head + 1) % capacity;
+
+                if (next_head == tail) {
+                    // Buffer full - drop oldest data (move tail forward)
+                    // This prevents blocking the WebSocket event handler
+                    tail = (tail + 1) % capacity;
+                    ESP_LOGW(TAG, "Buffer overflow, dropping oldest data");
+                }
+
+                buffer[head] = data[written];
+                head = next_head;
+                written++;
+            }
+
+            xSemaphoreGive(mutex);
+
+            // Signal that data is available
+            xSemaphoreGive(data_available);
+
+            return written;
+        }
+
+        /**
+         * Read data from the buffer (consumer)
+         * Called from client_readline/client_read_bytes in main task
+         *
+         * @param data Buffer to read into
+         * @param len Maximum bytes to read
+         * @return Number of bytes read
+         */
+        size_t read(uint8_t* data, size_t len) {
+            if (buffer == NULL || mutex == NULL || len == 0 || data == NULL) return 0;
+
+            xSemaphoreTake(mutex, portMAX_DELAY);
+
+            size_t read_count = 0;
+            while (read_count < len && tail != head) {
+                data[read_count] = buffer[tail];
+                tail = (tail + 1) % capacity;
+                read_count++;
+            }
+
+            xSemaphoreGive(mutex);
+            return read_count;
+        }
+
+        /**
+         * Read a single byte from the buffer
+         * Useful for line-by-line reading
+         *
+         * @param byte Pointer to store the byte
+         * @return 1 if byte read, 0 if buffer empty
+         */
+        size_t read_byte(uint8_t* byte) {
+            return read(byte, 1);
+        }
+
+        /**
+         * Get number of bytes available for reading
+         * @return Bytes available in buffer
+         */
+        size_t available() const {
+            if (buffer == NULL) return 0;
+
+            // Note: This is safe without mutex for single reader/writer
+            // as head and tail are volatile
+            if (head >= tail) {
+                return head - tail;
+            }
+            return capacity - tail + head;
+        }
+
+        /**
+         * Wait for data to be available
+         * Blocks until data is written or timeout occurs
+         *
+         * @param timeout_ms Timeout in milliseconds
+         * @return true if data available, false on timeout
+         */
+        bool wait_for_data(uint32_t timeout_ms) {
+            if (available() > 0) return true;
+            if (data_available == NULL) return false;
+
+            return xSemaphoreTake(data_available, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+        }
+
+        /**
+         * Clear all data in the buffer
+         * Called on disconnect to reset state
+         */
+        void clear() {
+            if (mutex == NULL) return;
+
+            xSemaphoreTake(mutex, portMAX_DELAY);
+            head = 0;
+            tail = 0;
+            xSemaphoreGive(mutex);
+
+            // Reset the semaphore
+            if (data_available) {
+                xSemaphoreTake(data_available, 0);  // Clear without waiting
+            }
+        }
+
+        /**
+         * Check if buffer is empty
+         * @return true if buffer is empty
+         */
+        bool empty() const {
+            return available() == 0;
+        }
+
+        /**
+         * Get buffer capacity
+         * @return Total capacity in bytes
+         */
+        size_t get_capacity() const {
+            return capacity;
+        }
     };
 
 }; // namespace NATSUtil

@@ -11,9 +11,11 @@ An ESP-IDF and FreeRTOS compatible C++ library for communicating with a [NATS](h
 - Familiar C++ object-oriented API, similar usage to the official NATS client
   APIs
 - Automatically attempts to reconnect to NATS server if the connection is dropped
+- **Transport abstraction layer** - Supports TCP, TLS, and WebSocket transports
+- **WebSocket support (ws:// and wss://)** - Connect through firewalls and load balancers using ESP-IDF's esp_websocket_client
 - **TLS/SSL support** with server certificate validation and mutual TLS (mTLS)
 - **DNS resolution** - Connect using hostnames, not just IP addresses
-- **Multiple server URLs with automatic failover** - High availability support
+- **Multiple server URLs with automatic failover** - High availability support (TCP and WebSocket)
 - **NATS 2.0 Headers** - Publish and receive messages with headers (HPUB/HMSG)
 - **Request timeouts** - Prevent hanging requests with configurable timeouts
 - **Async/non-blocking API** - connect_async() for better FreeRTOS integration
@@ -36,7 +38,7 @@ An ESP-IDF and FreeRTOS compatible C++ library for communicating with a [NATS](h
 **Via ESP-IDF Component Registry (recommended):**
 
 ```bash
-idf.py add-dependency "debsahu/espidf-nats^1.0.2"
+idf.py add-dependency "debsahu/espidf-nats^1.1.0"
 ```
 
 **Or clone the repository as an ESP-IDF component:**
@@ -84,10 +86,13 @@ See `example/README.md` for detailed instructions.
 The library is modularized into separate headers for better maintainability and readability:
 
 - **`include/espidf_nats.h`** - Main header that includes all modules (use this in your code)
-- **`include/espidf_nats/config.h`** - Configuration defines and constants
-- **`include/espidf_nats/util.h`** - Utility classes (Array, Queue, MillisTimer)
-- **`include/espidf_nats/types.h`** - Type definitions (structs, enums)
+- **`include/espidf_nats/config.h`** - Configuration defines, constants, and WebSocket settings
+- **`include/espidf_nats/util.h`** - Utility classes (Array, Queue, MillisTimer, RingBuffer)
+- **`include/espidf_nats/types.h`** - Type definitions (transport types, structs, enums)
 - **`include/espidf_nats/subscription.h`** - Subscription management
+- **`include/espidf_nats/transport.h`** - Abstract transport interface
+- **`include/espidf_nats/tcp_transport.h`** - TCP/TLS transport implementation
+- **`include/espidf_nats/ws_transport.h`** - WebSocket transport implementation (optional)
 - **`include/espidf_nats/nats_client.h`** - Main NATS client class
 
 Simply `#include "espidf_nats.h"` in your code - all modules are included automatically.
@@ -201,6 +206,88 @@ nats_tls_config_t tls_config = {
 
 // When using mTLS for authentication, user/pass can be NULL
 NATS nats("nats.example.com", 4222, NULL, NULL, &tls_config);
+```
+
+## WebSocket Support
+
+Connect to NATS servers using WebSocket transport (ws:// and wss://), allowing connections through firewalls and load balancers that only allow HTTP/HTTPS traffic.
+
+### Requirements
+
+1. Enable WebSocket client in ESP-IDF menuconfig:
+   ```
+   Component config → ESP-TLS → [*] Enable WebSocket Client
+   ```
+
+2. Or add to your project's `sdkconfig.defaults`:
+   ```
+   CONFIG_ESP_WEBSOCKET_CLIENT_ENABLE=y
+   ```
+
+### Basic WebSocket Connection
+
+```c
+// Simple WebSocket connection (ws://)
+NATS* nats = NATS::create_websocket("nats.example.com", 9222);
+nats->on_connect = []() { ESP_LOGI(TAG, "WebSocket connected!"); };
+
+if (nats->connect()) {
+    nats->subscribe("events.*", [](NATS::msg e) {
+        ESP_LOGI(TAG, "Received: %s", e.data);
+    });
+
+    while(1) {
+        nats->process();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+delete nats;  // Factory methods return pointers
+```
+
+### Secure WebSocket (wss://)
+
+```c
+nats_tls_config_t tls_config = {
+    .enabled = true,
+    .ca_cert = (const char*)ca_cert_pem_start,
+    .ca_cert_len = ca_cert_pem_end - ca_cert_pem_start,
+    .skip_cert_verification = false,
+    .server_name = "nats.example.com"
+};
+
+NATS* nats = NATS::create_websocket("nats.example.com", 443, "user", "pass", &tls_config, "/nats");
+```
+
+### WebSocket from URI
+
+```c
+// Auto-detects TLS from wss:// scheme
+NATS* nats = NATS::create_websocket_uri("wss://nats.example.com:443/nats", "user", "pass");
+```
+
+### Multiple WebSocket Servers with Failover
+
+```c
+nats_server_t ws_servers[] = {
+    {"ws1.example.com", 9222, NATS_TRANSPORT_WEBSOCKET, "/nats"},
+    {"ws2.example.com", 9222, NATS_TRANSPORT_WEBSOCKET, "/nats"},
+    {"ws3.example.com", 9222, NATS_TRANSPORT_WEBSOCKET, "/nats"}
+};
+
+NATS* nats = NATS::create_websocket(ws_servers, 3, "user", "pass", &tls_config);
+// Automatically connects to first available server
+// Falls over to next server on disconnect
+```
+
+### WebSocket Configuration
+
+WebSocket settings can be customized in `config.h`:
+
+```c
+#define NATS_WEBSOCKET_BUFFER_SIZE 8192        // Ring buffer size
+#define NATS_WEBSOCKET_PATH "/nats"            // Default path
+#define NATS_WEBSOCKET_SUBPROTOCOL "nats"      // WebSocket subprotocol
+#define NATS_WEBSOCKET_RECONNECT_TIMEOUT 10000 // Reconnect timeout (ms)
 ```
 
 ## Advanced Features

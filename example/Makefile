@@ -1,7 +1,8 @@
 # Makefile for NATS Test Application
 # Provides convenient commands for Docker NATS servers and ESP-IDF build/flash
 
-.PHONY: help nats-up nats-down nats-logs nats-status certs-gen build flash monitor clean
+.PHONY: help nats-up nats-down nats-logs nats-status certs-gen build flash monitor clean \
+        nats-websocket nats-websocket-tls test-websocket test-websocket-tls
 
 # Default target
 help:
@@ -10,30 +11,36 @@ help:
 	@echo "╚════════════════════════════════════════════════════════════╝"
 	@echo ""
 	@echo "Docker NATS Servers:"
-	@echo "  make nats-up          - Start all NATS servers"
-	@echo "  make nats-basic       - Start basic NATS server only (port 4222)"
-	@echo "  make nats-jetstream   - Start JetStream NATS server (port 4223)"
-	@echo "  make nats-tls         - Start TLS NATS server (port 4224)"
-	@echo "  make nats-down        - Stop all NATS servers"
-	@echo "  make nats-logs        - Show logs from all NATS servers"
-	@echo "  make nats-status      - Show status of NATS servers"
-	@echo "  make certs-gen        - Generate TLS certificates"
+	@echo "  make nats-up            - Start all NATS servers"
+	@echo "  make nats-basic         - Start basic NATS server only (port 4222)"
+	@echo "  make nats-jetstream     - Start JetStream NATS server (port 4223)"
+	@echo "  make nats-tls           - Start TLS NATS server (port 4224)"
+	@echo "  make nats-websocket     - Start WebSocket NATS server (ws:// port 9222)"
+	@echo "  make nats-websocket-tls - Start Secure WebSocket NATS (wss:// port 9223)"
+	@echo "  make nats-down          - Stop all NATS servers"
+	@echo "  make nats-logs          - Show logs from all NATS servers"
+	@echo "  make nats-status        - Show status of NATS servers"
+	@echo "  make certs-gen          - Generate TLS certificates"
 	@echo ""
 	@echo "ESP-IDF Build/Flash:"
-	@echo "  make build            - Build the ESP-IDF project"
-	@echo "  make flash            - Flash to ESP32"
-	@echo "  make monitor          - Open serial monitor"
-	@echo "  make flash-monitor    - Flash and monitor"
-	@echo "  make clean            - Clean build artifacts"
+	@echo "  make build              - Build the ESP-IDF project"
+	@echo "  make flash              - Flash to ESP32"
+	@echo "  make monitor            - Open serial monitor"
+	@echo "  make flash-monitor      - Flash and monitor"
+	@echo "  make clean              - Clean build artifacts"
 	@echo ""
 	@echo "Testing:"
-	@echo "  make test-local       - Run with local NATS (start server + flash + monitor)"
+	@echo "  make test-local         - Run with basic NATS (TCP)"
+	@echo "  make test-websocket     - Run with WebSocket NATS (ws://)"
+	@echo "  make test-websocket-tls - Run with Secure WebSocket NATS (wss://)"
 	@echo ""
 	@echo "Default NATS ports:"
-	@echo "  - Basic NATS:     localhost:4222"
-	@echo "  - JetStream NATS: localhost:4223"
-	@echo "  - TLS NATS:       localhost:4224"
-	@echo "  - Monitoring:     http://localhost:8222, 8223, 8224"
+	@echo "  - Basic NATS:       localhost:4222"
+	@echo "  - JetStream NATS:   localhost:4223"
+	@echo "  - TLS NATS:         localhost:4224"
+	@echo "  - WebSocket (ws):   localhost:9222"
+	@echo "  - WebSocket (wss):  localhost:9223"
+	@echo "  - Monitoring:       http://localhost:8222-8226"
 	@echo ""
 
 # Docker NATS Server Commands (using modern 'docker compose' syntax)
@@ -64,6 +71,24 @@ nats-tls:
 	@sleep 2
 	@docker compose ps nats-tls
 
+nats-websocket:
+	@echo "🚀 Starting WebSocket NATS server (ws://)..."
+	docker compose up -d nats-websocket
+	@sleep 2
+	@docker compose ps nats-websocket
+	@echo ""
+	@echo "✅ WebSocket server available at ws://localhost:9222/nats"
+
+nats-websocket-tls:
+	@echo "🚀 Starting Secure WebSocket NATS server (wss://) with certificate generation..."
+	docker compose up -d generate-certs
+	@sleep 2
+	docker compose up -d nats-websocket-tls
+	@sleep 2
+	@docker compose ps nats-websocket-tls
+	@echo ""
+	@echo "✅ Secure WebSocket server available at wss://localhost:9223/nats"
+
 nats-down:
 	@echo "🛑 Stopping all NATS servers..."
 	docker compose down
@@ -77,9 +102,18 @@ nats-status:
 	@docker compose ps
 	@echo ""
 	@echo "🌐 Monitoring URLs:"
-	@echo "  - Basic NATS:     http://localhost:8222"
-	@echo "  - JetStream NATS: http://localhost:8223"
-	@echo "  - TLS NATS:       http://localhost:8224"
+	@echo "  - Basic NATS:         http://localhost:8222"
+	@echo "  - JetStream NATS:     http://localhost:8223"
+	@echo "  - TLS NATS:           http://localhost:8224"
+	@echo "  - WebSocket NATS:     http://localhost:8225"
+	@echo "  - WebSocket TLS NATS: http://localhost:8226"
+	@echo ""
+	@echo "📡 Connection URLs:"
+	@echo "  - TCP:         nats://YOUR_SERVER_IP:4222"
+	@echo "  - JetStream:   nats://YOUR_SERVER_IP:4223"
+	@echo "  - TLS:         tls://YOUR_SERVER_IP:4224"
+	@echo "  - WebSocket:   ws://YOUR_SERVER_IP:9222/nats"
+	@echo "  - WebSocket+TLS: wss://YOUR_SERVER_IP:9223/nats"
 
 certs-gen:
 	@echo "🔐 Generating TLS certificates..."
@@ -113,7 +147,27 @@ clean:
 test-local: nats-basic
 	@echo ""
 	@echo "✅ NATS server running at localhost:4222"
-	@echo "📝 Update main/main.cpp to use: localhost or host.docker.internal"
+	@echo "📝 Update main/main.cpp to use your server IP"
+	@echo ""
+	@echo "Press Enter when ready to flash and monitor..."
+	@read dummy
+	@make flash-monitor
+
+test-websocket: nats-websocket
+	@echo ""
+	@echo "✅ WebSocket NATS server running"
+	@echo "📝 WebSocket URL: ws://YOUR_SERVER_IP:9222/nats"
+	@echo "📝 Enable RUN_WEBSOCKET_TESTS in main.cpp"
+	@echo ""
+	@echo "Press Enter when ready to flash and monitor..."
+	@read dummy
+	@make flash-monitor
+
+test-websocket-tls: nats-websocket-tls
+	@echo ""
+	@echo "✅ Secure WebSocket NATS server running"
+	@echo "📝 WebSocket URL: wss://YOUR_SERVER_IP:9223/nats"
+	@echo "📝 Enable RUN_WEBSOCKET_TLS_TESTS in main.cpp"
 	@echo ""
 	@echo "Press Enter when ready to flash and monitor..."
 	@read dummy

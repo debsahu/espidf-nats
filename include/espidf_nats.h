@@ -8,8 +8,10 @@
  *
  * Features:
  * - TLS/SSL support with server certificate validation and mutual TLS (mTLS)
+ * - WebSocket transport support (ws:// and wss://) via esp_websocket_client
+ * - Transport abstraction layer for TCP and WebSocket
  * - DNS resolution - Connect using hostnames, not just IP addresses
- * - Multiple server URLs with automatic failover
+ * - Multiple server URLs with automatic failover (TCP and WebSocket)
  * - NATS 2.0 Headers support (HPUB/HMSG)
  * - Request timeouts - Prevent hanging requests
  * - Async/non-blocking API
@@ -29,9 +31,12 @@
  *
  * This library is modularized into separate headers for better maintainability:
  * - config.h: Configuration defines and constants
- * - util.h: Utility classes (Array, Queue, MillisTimer)
- * - types.h: Type definitions (structs, enums)
+ * - util.h: Utility classes (Array, Queue, MillisTimer, RingBuffer)
+ * - types.h: Type definitions (structs, enums, transport types)
  * - subscription.h: Subscription management
+ * - transport.h: Abstract transport interface
+ * - tcp_transport.h: TCP/TLS transport implementation
+ * - ws_transport.h: WebSocket transport implementation (optional)
  * - nats_client.h: Main NATS client class
  */
 

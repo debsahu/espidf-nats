@@ -20,12 +20,45 @@ typedef struct {
 } nats_tls_config_t;
 
 /**
+ * Transport type for multi-transport support
+ */
+typedef enum {
+    NATS_TRANSPORT_TCP = 0,            // TCP/TLS transport (default)
+    NATS_TRANSPORT_WEBSOCKET           // WebSocket transport
+} nats_transport_type_t;
+
+/**
+ * Transport state
+ */
+typedef enum {
+    TRANSPORT_DISCONNECTED = 0,
+    TRANSPORT_CONNECTING,
+    TRANSPORT_CONNECTED,
+    TRANSPORT_ERROR
+} nats_transport_state_t;
+
+/**
  * Server definition for multi-server support
  */
 typedef struct {
     const char* hostname;              // Server hostname or IP
     int port;                          // Server port
+    nats_transport_type_t transport_type;  // Transport type (TCP or WebSocket)
+    const char* ws_path;               // WebSocket path (e.g., "/nats")
 } nats_server_t;
+
+/**
+ * Transport configuration for connection setup
+ */
+typedef struct {
+    const char* hostname;              // Server hostname
+    int port;                          // Server port
+    const char* user;                  // Username (optional)
+    const char* pass;                  // Password (optional)
+    const nats_tls_config_t* tls_config;  // TLS configuration (optional)
+    const char* ws_path;               // WebSocket path (e.g., "/nats")
+    const char* ws_subprotocol;        // WebSocket subprotocol ("nats")
+} nats_transport_config_t;
 
 /**
  * Connection metrics and statistics
@@ -58,7 +91,10 @@ typedef enum {
     NATS_ERR_INVALID_CONFIG,           // Invalid configuration
     NATS_ERR_INVALID_ARG,              // Invalid argument
     NATS_ERR_OUT_OF_MEMORY,            // Out of memory
-    NATS_ERR_TOO_MANY_SUBS             // Subscription limit exceeded
+    NATS_ERR_TOO_MANY_SUBS,            // Subscription limit exceeded
+    NATS_ERR_WEBSOCKET_INIT_FAILED,    // WebSocket initialization failed
+    NATS_ERR_WEBSOCKET_SEND_FAILED,    // WebSocket send failed
+    NATS_ERR_WEBSOCKET_HANDSHAKE_FAILED // WebSocket handshake failed
 } nats_error_code_t;
 
 /**

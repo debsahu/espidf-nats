@@ -9,9 +9,11 @@ This directory contains Docker Compose configuration to run NATS servers locally
 make nats-up
 
 # Or start specific servers
-make nats-basic        # Basic NATS (port 4222)
-make nats-jetstream    # JetStream enabled (port 4223)
-make nats-tls          # TLS/SSL enabled (port 4224)
+make nats-basic         # Basic NATS (port 4222)
+make nats-jetstream     # JetStream enabled (port 4223)
+make nats-tls           # TLS/SSL enabled (port 4224)
+make nats-websocket     # WebSocket (ws:// port 9222)
+make nats-websocket-tls # Secure WebSocket (wss:// port 9223)
 
 # Stop all servers
 make nats-down
@@ -117,6 +119,65 @@ nats_tls_config_t tls_config = {
 NATS nats("host.docker.internal", 4224, NULL, NULL, &tls_config);
 ```
 
+### 4. WebSocket NATS Server (nats-websocket)
+
+**Port:** 9222 (WebSocket), 4225 (TCP)
+**Monitoring:** http://localhost:8225
+
+NATS server with WebSocket support for browser-compatible connections and ESP32 WebSocket transport.
+
+```bash
+# Start
+docker-compose up -d nats-websocket
+
+# Or use make
+make nats-websocket
+```
+
+**Connect from ESP32:**
+```cpp
+// WebSocket connection (ws://)
+NATS* nats = NATS::create_websocket("192.168.1.100", 9222);
+nats->connect();
+```
+
+### 5. Secure WebSocket NATS Server (nats-websocket-tls)
+
+**Port:** 9223 (WebSocket TLS), 4226 (TCP)
+**Monitoring:** http://localhost:8226
+
+NATS server with Secure WebSocket (wss://) for encrypted WebSocket connections.
+
+```bash
+# Generate certificates (first time only)
+make certs-gen
+
+# Start Secure WebSocket server
+docker-compose up -d nats-websocket-tls
+
+# Or use make (auto-generates certs)
+make nats-websocket-tls
+```
+
+**Connect from ESP32:**
+```cpp
+// Secure WebSocket connection (wss://)
+// First, embed the CA certificate in your code
+static const char ws_ca_cert[] =
+"-----BEGIN CERTIFICATE-----\n"
+"... contents of docker/certs/ca-cert.pem ...\n"
+"-----END CERTIFICATE-----\n";
+
+nats_tls_config_t tls_config = {};
+tls_config.enabled = true;
+tls_config.ca_cert = ws_ca_cert;
+tls_config.ca_cert_len = sizeof(ws_ca_cert);
+tls_config.skip_cert_verification = false;
+
+NATS* nats = NATS::create_websocket("192.168.1.100", 9223, NULL, NULL, &tls_config);
+nats->connect();
+```
+
 ## TLS Certificates
 
 Certificates are automatically generated when starting the TLS server for the first time.
@@ -187,6 +248,8 @@ Each NATS server exposes an HTTP monitoring endpoint:
 - **Basic NATS:** http://localhost:8222
 - **JetStream NATS:** http://localhost:8223
 - **TLS NATS:** http://localhost:8224
+- **WebSocket NATS:** http://localhost:8225
+- **WebSocket TLS NATS:** http://localhost:8226
 
 **Available endpoints:**
 - `/varz` - General server information
@@ -300,22 +363,22 @@ docker-compose up -d nats-jetstream
          │
          │ WiFi
          │
-┌────────▼────────────────────────────┐
-│      Host Machine Network           │
-│  ┌────────────────────────────────┐ │
-│  │  Docker Bridge Network         │ │
-│  │  ┌──────────┐  ┌──────────┐   │ │
-│  │  │  nats-   │  │  nats-   │   │ │
-│  │  │  basic   │  │jetstream │   │ │
-│  │  │  :4222   │  │  :4223   │   │ │
-│  │  └──────────┘  └──────────┘   │ │
-│  │  ┌──────────┐                 │ │
-│  │  │  nats-   │                 │ │
-│  │  │   tls    │                 │ │
-│  │  │  :4224   │                 │ │
-│  │  └──────────┘                 │ │
-│  └────────────────────────────────┘ │
-└─────────────────────────────────────┘
+┌────────▼─────────────────────────────────────────┐
+│      Host Machine Network                         │
+│  ┌─────────────────────────────────────────────┐ │
+│  │  Docker Bridge Network                       │ │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │ │
+│  │  │  nats-   │  │  nats-   │  │  nats-   │  │ │
+│  │  │  basic   │  │jetstream │  │   tls    │  │ │
+│  │  │  :4222   │  │  :4223   │  │  :4224   │  │ │
+│  │  └──────────┘  └──────────┘  └──────────┘  │ │
+│  │  ┌──────────┐  ┌──────────┐                │ │
+│  │  │  nats-   │  │  nats-   │                │ │
+│  │  │websocket │  │ws-tls    │                │ │
+│  │  │  :9222   │  │  :9223   │                │ │
+│  │  └──────────┘  └──────────┘                │ │
+│  └─────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────┘
 ```
 
 ## Advanced Configuration
@@ -326,6 +389,8 @@ Edit configuration files in `docker/config/`:
 - `nats-basic.conf`
 - `nats-jetstream.conf`
 - `nats-tls.conf`
+- `nats-websocket.conf`
+- `nats-websocket-tls.conf`
 
 Then rebuild:
 ```bash

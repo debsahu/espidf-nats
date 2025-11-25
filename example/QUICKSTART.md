@@ -37,13 +37,15 @@ make flash-monitor    # Flash and monitor in one command
 
 ### Docker NATS Servers
 ```bash
-make nats-up          # Start all NATS servers
-make nats-down        # Stop all NATS servers
-make nats-status      # Check status
-make nats-logs        # View logs
-make nats-basic       # Start basic NATS only (4222)
-make nats-jetstream   # Start JetStream NATS (4223)
-make nats-tls         # Start TLS NATS (4224)
+make nats-up            # Start all NATS servers
+make nats-down          # Stop all NATS servers
+make nats-status        # Check status
+make nats-logs          # View logs
+make nats-basic         # Start basic NATS only (4222)
+make nats-jetstream     # Start JetStream NATS (4223)
+make nats-tls           # Start TLS NATS (4224)
+make nats-websocket     # Start WebSocket NATS (ws:// 9222)
+make nats-websocket-tls # Start Secure WebSocket NATS (wss:// 9223)
 ```
 
 ### Build & Flash
@@ -57,16 +59,20 @@ make clean            # Clean build artifacts
 
 ### Complete Testing Workflow
 ```bash
-make test-local       # Start NATS + flash + monitor (interactive)
+make test-local         # Start NATS + flash + monitor (interactive)
+make test-websocket     # Start WebSocket NATS + flash + monitor
+make test-websocket-tls # Start Secure WebSocket + flash + monitor
 ```
 
 ## 🌐 NATS Server Ports
 
-| Server      | Client Port | Monitor URL              |
-|-------------|-------------|--------------------------|
-| Basic       | 4222        | http://localhost:8222    |
-| JetStream   | 4223        | http://localhost:8223    |
-| TLS         | 4224        | http://localhost:8224    |
+| Server         | Client Port | Monitor URL              |
+|----------------|-------------|--------------------------|
+| Basic          | 4222        | http://localhost:8222    |
+| JetStream      | 4223        | http://localhost:8223    |
+| TLS            | 4224        | http://localhost:8224    |
+| WebSocket      | 9222        | http://localhost:8225    |
+| WebSocket TLS  | 9223        | http://localhost:8226    |
 
 ## 🔧 Troubleshooting
 
