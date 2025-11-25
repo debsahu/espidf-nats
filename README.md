@@ -1,8 +1,8 @@
 # NATS - ESP-IDF Client
 
-An ESP-IDF and FreeRTOS (probably) compatible C++ library for communicating with a [NATS](http://nats.io) server.
+An ESP-IDF and FreeRTOS compatible C++ library for communicating with a [NATS](http://nats.io) server.
 
-This module is was ported from https://github.com/isobit/arduino-nats and aims to remain compatible with it.
+> **Note:** This is an actively maintained fork of [daed/espidf-nats](https://github.com/daed/espidf-nats), which was originally ported from [arduino-nats](https://github.com/isobit/arduino-nats). This fork adds comprehensive JetStream support, Key-Value Store, Object Store, TLS/SSL, and many reliability improvements.
 
 ## Features
 
@@ -37,14 +37,14 @@ Clone the repository as an ESP-IDF component:
 
 ```bash
 cd your-esp-idf-project/components
-git clone https://github.com/daed/espidf-nats.git
+git clone https://github.com/debsahu/espidf-nats.git
 ```
 
 Or add as a git submodule:
 
 ```bash
 cd your-esp-idf-project
-git submodule add https://github.com/daed/espidf-nats.git components/espidf-nats
+git submodule add https://github.com/debsahu/espidf-nats.git components/espidf-nats
 ```
 
 Then include in your code:
