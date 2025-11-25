@@ -33,14 +33,20 @@ An ESP-IDF and FreeRTOS compatible C++ library for communicating with a [NATS](h
 
 ### Installation
 
-Clone the repository as an ESP-IDF component:
+**Via ESP-IDF Component Registry (recommended):**
+
+```bash
+idf.py add-dependency "debsahu/espidf-nats^1.0.1"
+```
+
+**Or clone the repository as an ESP-IDF component:**
 
 ```bash
 cd your-esp-idf-project/components
 git clone https://github.com/debsahu/espidf-nats.git
 ```
 
-Or add as a git submodule:
+**Or add as a git submodule:**
 
 ```bash
 cd your-esp-idf-project
