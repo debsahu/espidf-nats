@@ -1,0 +1,4 @@
+## IDF Component Manager Manifest File
+dependencies:
+  # ESP WebSocket Client component (required for WebSocket transport)
+  espressif/esp_websocket_client: "^1.0.0"

@@ -3,7 +3,7 @@
 
 // NATS client identification
 #define NATS_CLIENT_LANG "espidf"
-#define NATS_CLIENT_VERSION "1.0.2"
+#define NATS_CLIENT_VERSION "1.1.0"
 
 // Configuration options (can be overridden before including)
 #ifndef NATS_CONF_VERBOSE
@@ -56,6 +56,23 @@
 #define NATS_CTRL_PING "PING"
 #define NATS_CTRL_PONG "PONG"
 #define NATS_CTRL_INFO "INFO"
+
+// WebSocket configuration
+#ifndef NATS_WEBSOCKET_BUFFER_SIZE
+#define NATS_WEBSOCKET_BUFFER_SIZE 8192
+#endif
+
+#ifndef NATS_WEBSOCKET_PATH
+#define NATS_WEBSOCKET_PATH "/nats"
+#endif
+
+#ifndef NATS_WEBSOCKET_SUBPROTOCOL
+#define NATS_WEBSOCKET_SUBPROTOCOL "nats"
+#endif
+
+#ifndef NATS_WEBSOCKET_RECONNECT_TIMEOUT
+#define NATS_WEBSOCKET_RECONNECT_TIMEOUT 10000
+#endif
 
 // Logging tag (inline to avoid ODR violations)
 inline const char* tag = "espidf-nats";

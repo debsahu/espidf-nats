@@ -58,6 +58,45 @@ services:
     depends_on:
       - generate-certs
 
+  # NATS server with WebSocket enabled (ws://)
+  nats-websocket:
+    image: nats:latest
+    container_name: nats-websocket
+    ports:
+      - "4225:4222"   # TCP Client connections
+      - "9222:9222"   # WebSocket connections (ws://)
+      - "8225:8222"   # HTTP monitoring
+    command:
+      - "-c"
+      - "/config/nats-websocket.conf"
+    volumes:
+      - ./docker/config/nats-websocket.conf:/config/nats-websocket.conf:ro
+      - nats-websocket-data:/data
+    networks:
+      - nats-network
+    restart: unless-stopped
+
+  # NATS server with Secure WebSocket (wss://)
+  nats-websocket-tls:
+    image: nats:latest
+    container_name: nats-websocket-tls
+    ports:
+      - "4226:4222"   # TCP Client connections
+      - "9223:9223"   # Secure WebSocket connections (wss://)
+      - "8226:8222"   # HTTP monitoring
+    command:
+      - "-c"
+      - "/config/nats-websocket-tls.conf"
+    volumes:
+      - ./docker/certs:/certs:ro
+      - ./docker/config/nats-websocket-tls.conf:/config/nats-websocket-tls.conf:ro
+      - nats-websocket-tls-data:/data
+    networks:
+      - nats-network
+    restart: unless-stopped
+    depends_on:
+      - generate-certs
+
   # Helper service to generate test certificates
   generate-certs:
     image: alpine:latest
@@ -77,4 +116,8 @@ volumes:
   nats-jetstream-data:
     driver: local
   nats-tls-data:
+    driver: local
+  nats-websocket-data:
+    driver: local
+  nats-websocket-tls-data:
     driver: local

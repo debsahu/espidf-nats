@@ -243,6 +243,34 @@ nats-test-app/
     └── main.cpp                # Test application code
 ```
 
+## Testing Instructions
+
+### Test existing TCP functionality (regression test)
+```bash
+make nats-jetstream && make flash-monitor
+```
+
+### Test WebSocket (ws://)
+1. Update `WEBSOCKET_SERVER_IP` in `main/main.cpp` to your server IP
+2. Set `RUN_WEBSOCKET_TESTS 1` in `main/main.cpp`
+3. Run:
+```bash
+make test-websocket
+```
+
+### Test Secure WebSocket (wss://)
+1. Generate certificates first:
+```bash
+make certs-gen
+```
+2. Copy CA certificate content from `docker/certs/ca-cert.pem` to `ws_ca_cert` in `main/main.cpp`
+3. Update `WEBSOCKET_SERVER_IP` in `main/main.cpp` to your server IP
+4. Set `RUN_WEBSOCKET_TLS_TESTS 1` in `main/main.cpp`
+5. Run:
+```bash
+make test-websocket-tls
+```
+
 ## Next Steps
 
 After running these tests successfully:
@@ -253,6 +281,7 @@ After running these tests successfully:
 4. **Headers**: Test NATS 2.0 headers (HPUB/HMSG)
 5. **Stress Testing**: Increase message volume and concurrent tasks
 6. **Reconnection**: Test disconnect/reconnect scenarios
+7. **WebSocket**: Test WebSocket transport (ws:// and wss://)
 
 ## Component Source
 

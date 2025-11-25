@@ -25,6 +25,22 @@
 #include "util.h"
 #include "types.h"
 #include "subscription.h"
+#include "transport.h"
+#include "tcp_transport.h"
+
+// Auto-detect esp_websocket_client availability using __has_include (C++17)
+// This is more reliable than CMake-defined macros for managed components
+#if defined(__has_include)
+    #if __has_include(<esp_websocket_client.h>)
+        #ifndef CONFIG_ESP_WEBSOCKET_CLIENT_ENABLE
+            #define CONFIG_ESP_WEBSOCKET_CLIENT_ENABLE 1
+        #endif
+    #endif
+#endif
+
+#ifdef CONFIG_ESP_WEBSOCKET_CLIENT_ENABLE
+#include "ws_transport.h"
+#endif
 
 typedef void (*event_cb)();
 typedef void (*connect_cb)(bool success);
@@ -42,6 +58,11 @@ class NATS {
             CONNECTED
         };
 
+        // Transport abstraction layer
+        NatsTransport* transport;
+        bool owns_transport;  // true if NATS owns the transport (delete in destructor)
+
+        // Legacy members kept for backward compatibility (used when transport is NULL)
         int sockfd;
         esp_tls_t* tls;
         // mbedtls contexts for STARTTLS upgrade
@@ -113,6 +134,8 @@ class NATS {
                 const char* user = NULL,
                 const char* pass = NULL,
                 const nats_tls_config_t* tls_cfg = NULL) :
+            transport(NULL),
+            owns_transport(false),
             sockfd(-1),
             tls(NULL),
             mbedtls_ssl(NULL),
@@ -157,7 +180,7 @@ class NATS {
                     last_error_code = NATS_ERR_INVALID_ARG;
                     this->pass = NULL;  // Reject invalid password
                 }
-                nats_server_t server = {hostname, port};
+                nats_server_t server = {hostname, port, NATS_TRANSPORT_TCP, NULL};
                 servers.push_back(server);
                 if (tls_cfg != NULL) {
                     tls_config = *tls_cfg;
@@ -207,6 +230,8 @@ class NATS {
                 const char* user = NULL,
                 const char* pass = NULL,
                 const nats_tls_config_t* tls_cfg = NULL) :
+            transport(NULL),
+            owns_transport(false),
             sockfd(-1),
             tls(NULL),
             mbedtls_ssl(NULL),
@@ -306,6 +331,12 @@ class NATS {
                 disconnect();
             }
 
+            // Clean up transport if owned
+            if (transport != NULL && owns_transport) {
+                delete transport;
+                transport = NULL;
+            }
+
             // Clean up mbedtls resources if still allocated
             cleanup_mbedtls();
 
@@ -341,6 +372,235 @@ class NATS {
                     state_mutex = NULL;
                 }
             }
+        }
+
+        // ====================================================================
+        // Factory Methods for Creating NATS with Different Transports
+        // ====================================================================
+
+        /**
+         * Create a NATS client with TCP transport
+         *
+         * @param hostname Server hostname
+         * @param port Server port (default: 4222)
+         * @param user Optional username
+         * @param pass Optional password
+         * @param tls_cfg Optional TLS configuration
+         * @return Pointer to new NATS instance (caller owns, delete when done)
+         */
+        static NATS* create_tcp(const char* hostname,
+                                int port = NATS_DEFAULT_PORT,
+                                const char* user = NULL,
+                                const char* pass = NULL,
+                                const nats_tls_config_t* tls_cfg = NULL) {
+            // Use existing constructor which creates TcpTransport internally
+            return new NATS(hostname, port, user, pass, tls_cfg);
+        }
+
+        /**
+         * Create a NATS client with TCP transport and multiple servers
+         *
+         * @param server_list Array of server definitions
+         * @param server_count Number of servers
+         * @param user Optional username
+         * @param pass Optional password
+         * @param tls_cfg Optional TLS configuration
+         * @return Pointer to new NATS instance (caller owns, delete when done)
+         */
+        static NATS* create_tcp(const nats_server_t* server_list,
+                                size_t server_count,
+                                const char* user = NULL,
+                                const char* pass = NULL,
+                                const nats_tls_config_t* tls_cfg = NULL) {
+            return new NATS(server_list, server_count, user, pass, tls_cfg);
+        }
+
+#ifdef CONFIG_ESP_WEBSOCKET_CLIENT_ENABLE
+        /**
+         * Create a NATS client with WebSocket transport
+         *
+         * @param hostname Server hostname
+         * @param port Server port (default: 9222 for ws, 443 for wss)
+         * @param user Optional username
+         * @param pass Optional password
+         * @param tls_cfg Optional TLS configuration (set enabled=true for wss://)
+         * @param ws_path WebSocket path (default: "/nats")
+         * @return Pointer to new NATS instance, or NULL on failure (caller owns)
+         */
+        static NATS* create_websocket(const char* hostname,
+                                       int port,
+                                       const char* user = NULL,
+                                       const char* pass = NULL,
+                                       const nats_tls_config_t* tls_cfg = NULL,
+                                       const char* ws_path = NATS_WEBSOCKET_PATH) {
+            // Create WebSocket transport
+            WebSocketTransport* ws_transport = new WebSocketTransport();
+            if (ws_transport == NULL) {
+                ESP_LOGE(tag, "Failed to allocate WebSocket transport");
+                return NULL;
+            }
+
+            // Create NATS client with single server
+            nats_server_t server = {hostname, port, NATS_TRANSPORT_WEBSOCKET, ws_path};
+            NATS* nats = new NATS(&server, 1, user, pass, tls_cfg);
+            if (nats == NULL) {
+                delete ws_transport;
+                return NULL;
+            }
+
+            // Assign transport
+            nats->transport = ws_transport;
+            nats->owns_transport = true;
+
+            return nats;
+        }
+
+        /**
+         * Create a NATS client with WebSocket transport from URI
+         *
+         * @param uri WebSocket URI (e.g., "ws://host:port/path" or "wss://host:port/path")
+         * @param user Optional username
+         * @param pass Optional password
+         * @param tls_cfg Optional TLS configuration (auto-enabled for wss://)
+         * @return Pointer to new NATS instance, or NULL on failure
+         */
+        static NATS* create_websocket_uri(const char* uri,
+                                           const char* user = NULL,
+                                           const char* pass = NULL,
+                                           const nats_tls_config_t* tls_cfg = NULL) {
+            // Parse URI to extract hostname, port, path
+            // Format: ws[s]://hostname[:port][/path]
+            if (uri == NULL) return NULL;
+
+            bool is_tls = (strncmp(uri, "wss://", 6) == 0);
+            const char* host_start = uri + (is_tls ? 6 : 5);  // Skip ws:// or wss://
+
+            // Find port and path
+            char hostname[256] = {0};
+            int port = is_tls ? 443 : 9222;  // Default ports
+            char path[256] = "/nats";
+
+            const char* colon = strchr(host_start, ':');
+            const char* slash = strchr(host_start, '/');
+
+            if (colon != NULL && (slash == NULL || colon < slash)) {
+                // Have port
+                size_t host_len = colon - host_start;
+                if (host_len >= sizeof(hostname)) host_len = sizeof(hostname) - 1;
+                strncpy(hostname, host_start, host_len);
+                hostname[host_len] = '\0';
+                port = atoi(colon + 1);
+            } else if (slash != NULL) {
+                // No port, have path
+                size_t host_len = slash - host_start;
+                if (host_len >= sizeof(hostname)) host_len = sizeof(hostname) - 1;
+                strncpy(hostname, host_start, host_len);
+                hostname[host_len] = '\0';
+            } else {
+                // Just hostname
+                strncpy(hostname, host_start, sizeof(hostname) - 1);
+            }
+
+            if (slash != NULL) {
+                strncpy(path, slash, sizeof(path) - 1);
+            }
+
+            // Create TLS config if needed
+            nats_tls_config_t tls_config_local;
+            memset(&tls_config_local, 0, sizeof(nats_tls_config_t));
+            const nats_tls_config_t* tls_to_use = tls_cfg;
+            if (is_tls && tls_cfg == NULL) {
+                tls_config_local.enabled = true;
+                tls_config_local.skip_cert_verification = true;  // Default for easy setup
+                tls_to_use = &tls_config_local;
+            } else if (is_tls && tls_cfg != NULL) {
+                tls_config_local = *tls_cfg;
+                tls_config_local.enabled = true;
+                tls_to_use = &tls_config_local;
+            }
+
+            return create_websocket(hostname, port, user, pass, tls_to_use, path);
+        }
+
+        /**
+         * Create a NATS client with WebSocket transport and multiple servers
+         *
+         * @param server_list Array of server definitions (with transport_type=NATS_TRANSPORT_WEBSOCKET)
+         * @param server_count Number of servers in the array
+         * @param user Optional username
+         * @param pass Optional password
+         * @param tls_cfg Optional TLS configuration (set enabled=true for wss://)
+         * @return Pointer to new NATS instance, or NULL on failure
+         */
+        static NATS* create_websocket(const nats_server_t* server_list,
+                                       size_t server_count,
+                                       const char* user = NULL,
+                                       const char* pass = NULL,
+                                       const nats_tls_config_t* tls_cfg = NULL) {
+            if (server_list == NULL || server_count == 0) {
+                ESP_LOGE(tag, "Invalid server list for WebSocket transport");
+                return NULL;
+            }
+
+            // Create WebSocket transport
+            WebSocketTransport* ws_transport = new WebSocketTransport();
+            if (ws_transport == NULL) {
+                ESP_LOGE(tag, "Failed to allocate WebSocket transport");
+                return NULL;
+            }
+
+            // Create server list with WebSocket transport type
+            nats_server_t* ws_servers = new nats_server_t[server_count];
+            if (ws_servers == NULL) {
+                delete ws_transport;
+                ESP_LOGE(tag, "Failed to allocate server list");
+                return NULL;
+            }
+
+            for (size_t i = 0; i < server_count; i++) {
+                ws_servers[i].hostname = server_list[i].hostname;
+                ws_servers[i].port = server_list[i].port;
+                ws_servers[i].transport_type = NATS_TRANSPORT_WEBSOCKET;
+                ws_servers[i].ws_path = server_list[i].ws_path ? server_list[i].ws_path : NATS_WEBSOCKET_PATH;
+            }
+
+            // Create NATS client
+            NATS* nats = new NATS(ws_servers, server_count, user, pass, tls_cfg);
+            delete[] ws_servers;  // NATS constructor copies the server list
+
+            if (nats == NULL) {
+                delete ws_transport;
+                return NULL;
+            }
+
+            // Assign transport
+            nats->transport = ws_transport;
+            nats->owns_transport = true;
+
+            return nats;
+        }
+#endif // CONFIG_ESP_WEBSOCKET_CLIENT_ENABLE
+
+        /**
+         * Set a custom transport (advanced usage)
+         *
+         * @param t Transport instance
+         * @param take_ownership If true, NATS will delete transport in destructor
+         */
+        void set_transport(NatsTransport* t, bool take_ownership = false) {
+            if (transport != NULL && owns_transport) {
+                delete transport;
+            }
+            transport = t;
+            owns_transport = take_ownership;
+        }
+
+        /**
+         * Get current transport (for advanced usage)
+         * @return Current transport, or NULL if using legacy socket mode
+         */
+        NatsTransport* get_transport() const {
+            return transport;
         }
 
     private:
@@ -385,6 +645,20 @@ class NATS {
         // Send raw data without appending CRLF (for binary payloads)
         bool send_raw(const char* data, size_t len) {
             if (data == NULL || len == 0) return true;
+
+            // Use transport if available
+            if (transport != NULL && transport->is_connected()) {
+                int ret = transport->send_data(data, len);
+                if (ret < 0 || (size_t)ret != len) {
+                    ESP_LOGE(tag, "Transport send_data failed");
+                    last_error_code = transport->get_last_error();
+                    disconnect();
+                    return false;
+                }
+                return true;
+            }
+
+            // Legacy socket mode
             ssize_t ret;
             bool success = true;
 
@@ -430,6 +704,21 @@ class NATS {
         void send(const char* msg) {
             if (msg == NULL) return;
             size_t len = strlen(msg);
+
+            // Use transport if available
+            if (transport != NULL && transport->is_connected()) {
+                int ret = transport->send_line(msg);
+                if (ret < 0) {
+                    ESP_LOGE(tag, "Transport send_line failed");
+                    last_error_code = transport->get_last_error();
+                    disconnect();
+                    return;
+                }
+                metrics.bytes_sent += len + strlen(NATS_CR_LF);
+                return;
+            }
+
+            // Legacy socket mode
             ssize_t ret;
             bool need_disconnect = false;  // Flag to track if we need to disconnect
 
@@ -663,7 +952,19 @@ class NATS {
                 char* buf = (char*)calloc(1, sizeof(char));
                 return buf;
             }
-            // Allocate n+1 for null terminator
+
+            // Use transport if available
+            if (transport != NULL && transport->is_connected()) {
+                char* buf = transport->read_bytes(n);
+                if (buf == NULL) {
+                    ESP_LOGE(tag, "Transport read_bytes failed");
+                    last_error_code = transport->get_last_error();
+                    disconnect();
+                }
+                return buf;
+            }
+
+            // Legacy socket mode - Allocate n+1 for null terminator
             char* buf = (char*)malloc(n + 1);
             if (buf == NULL) {
                 ESP_LOGE(tag, "Failed to allocate read buffer for %zu bytes", n);
@@ -712,6 +1013,13 @@ class NATS {
         void client_skip_bytes(size_t n) {
             if (n == 0) return;
 
+            // Use transport if available
+            if (transport != NULL && transport->is_connected()) {
+                transport->skip_bytes(n);
+                return;
+            }
+
+            // Legacy socket mode
             char discard[16];
             size_t remaining = n;
 
@@ -744,6 +1052,23 @@ class NATS {
         }
 
         char* client_readline(size_t cap = 128) {
+            // Use transport if available
+            if (transport != NULL && transport->is_connected()) {
+                char* line = transport->read_line(cap);
+                if (line == NULL || (line[0] == '\0' && !transport->is_connected())) {
+                    // Empty string with disconnected transport means error
+                    if (line != NULL && line[0] == '\0' && !transport->is_connected()) {
+                        ESP_LOGE(tag, "Transport read_line failed");
+                        last_error_code = transport->get_last_error();
+                        free(line);
+                        disconnect();
+                        return (char*)calloc(1, sizeof(char));
+                    }
+                }
+                return line;
+            }
+
+            // Legacy socket mode
             char* buf = (char*)malloc(cap * sizeof(char));
             if (buf == NULL) {
                 ESP_LOGE(tag, "Failed to allocate readline buffer");
@@ -1039,7 +1364,10 @@ class NATS {
                 }
 
                 // NATS STARTTLS: Upgrade to TLS if server requires it and TLS is configured
-                if (server_tls_required) {
+                // Note: Skip TLS upgrade for transport connections (WebSocket) since:
+                // - wss:// already provides TLS at the transport layer
+                // - ws:// cannot be upgraded to TLS mid-connection
+                if (server_tls_required && transport == NULL) {
                     if (!tls_config.enabled) {
                         ESP_LOGE(tag, "Server requires TLS but TLS not configured");
                         last_error_code = NATS_ERR_TLS_CONNECTION_FAILED;
@@ -1053,6 +1381,9 @@ class NATS {
                         free(buf);
                         return;
                     }
+                } else if (server_tls_required && transport != NULL) {
+                    // For WebSocket transport, TLS is handled at transport level (wss://)
+                    ESP_LOGI(tag, "Server requires TLS - already secured via transport (wss://)");
                 }
 
                 send_connect();
@@ -1593,6 +1924,81 @@ class NATS {
             return true;
         }
 
+        /**
+         * Connect using the transport abstraction layer
+         * Used when a transport is set via factory methods or set_transport()
+         */
+        bool connect_with_transport(unsigned long timeout_ms) {
+            if (transport == NULL) {
+                ESP_LOGE(tag, "No transport configured");
+                last_error_code = NATS_ERR_NOT_CONNECTED;
+                return false;
+            }
+
+            // Try connecting to all servers in the list
+            size_t start_idx = current_server_idx;
+            do {
+                const nats_server_t& server = servers[current_server_idx];
+                ESP_LOGI(tag, "Attempting transport connect to %s:%d",
+                    server.hostname, server.port);
+
+                // Build transport configuration
+                nats_transport_config_t config = {NULL, 0, NULL, NULL, NULL, NULL, NULL};
+                config.hostname = server.hostname;
+                config.port = server.port;
+                config.user = user;
+                config.pass = pass;
+                config.tls_config = tls_config.enabled ? &tls_config : NULL;
+                config.ws_path = server.ws_path ? server.ws_path : NATS_WEBSOCKET_PATH;
+                config.ws_subprotocol = NATS_WEBSOCKET_SUBPROTOCOL;
+
+                // Attempt connection via transport
+                if (transport->connect(&config)) {
+                    if (state_mutex != NULL) xSemaphoreTakeRecursive(state_mutex, portMAX_DELAY);
+                    outstanding_pings = 0;
+                    reconnect_attempts = 0;
+                    if (state_mutex != NULL) xSemaphoreGiveRecursive(state_mutex);
+                    connect_state = CONNECTING;
+                    metrics.last_connect_time = NATSUtil::millis();
+                    ESP_LOGI(tag, "Transport connected to %s:%d",
+                        server.hostname, server.port);
+
+                    // Wait for NATS protocol handshake
+                    unsigned long start_time = NATSUtil::millis();
+                    while (!connected && (NATSUtil::millis() - start_time) < timeout_ms) {
+                        // Check for incoming data
+                        if (transport->has_data_available(100)) {  // 100ms timeout
+                            recv();  // Process INFO message, send CONNECT
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                    }
+
+                    if (connected) {
+                        if (metrics.reconnections > 0) {
+                            metrics.reconnections++;
+                        }
+                        return true;
+                    } else {
+                        ESP_LOGE(tag, "NATS handshake timeout via transport");
+                        transport->disconnect();
+                    }
+                } else {
+                    ESP_LOGE(tag, "Transport connection failed: %s", transport->get_error_string());
+                    last_error_code = transport->get_last_error();
+                }
+
+                // Move to next server
+                current_server_idx = (current_server_idx + 1) % servers.size();
+            } while (current_server_idx != start_idx);
+
+            // All servers failed
+            if (state_mutex != NULL) xSemaphoreTakeRecursive(state_mutex, portMAX_DELAY);
+            reconnect_attempts++;
+            if (state_mutex != NULL) xSemaphoreGiveRecursive(state_mutex);
+            connect_state = DISCONNECTED;
+            return false;
+        }
+
         bool try_connect_to_server(const nats_server_t& server) {
             // NATS uses STARTTLS style: always connect plain TCP first,
             // then upgrade to TLS after receiving INFO with tls_required
@@ -1698,7 +2104,12 @@ class NATS {
                 return true;
             }
 
-            // Try connecting to all servers in the list
+            // Use transport if available
+            if (transport != NULL) {
+                return connect_with_transport(timeout_ms);
+            }
+
+            // Try connecting to all servers in the list (legacy socket mode)
             size_t start_idx = current_server_idx;
             do {
                 ESP_LOGI(tag, "Attempting to connect to %s:%d",
@@ -1770,7 +2181,7 @@ class NATS {
         }
 
         void disconnect() {
-            if (!connected) return;
+            if (!connected && (transport == NULL || !transport->is_connected())) return;
             connected = false;
             connect_state = DISCONNECTED;
             async_connect_cb = NULL;
@@ -1779,6 +2190,15 @@ class NATS {
                 last_error_code = NATS_ERR_DISCONNECTED;
             }
 
+            // Disconnect transport if using transport abstraction
+            if (transport != NULL) {
+                transport->disconnect();
+                // Don't clean up legacy resources when using transport
+                if (on_disconnect != NULL) on_disconnect();
+                return;
+            }
+
+            // Legacy cleanup (when not using transport)
             // Clean up mbedtls resources (STARTTLS mode)
             if (using_mbedtls_directly) {
                 cleanup_mbedtls();
@@ -3030,8 +3450,16 @@ class NATS {
 
             unsigned long start_time = NATSUtil::millis();
             while ((NATSUtil::millis() - start_time) < timeout_ms) {
-                // Process incoming messages
-                if (sockfd >= 0) {
+                // Handle transport-based connections (WebSocket)
+                if (transport != NULL) {
+                    if (transport->has_data_available(10)) {
+                        recv();
+                    }
+                    // Yield to prevent watchdog
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+                // Handle legacy sockfd-based connections (TCP/TLS)
+                else if (sockfd >= 0) {
                     int fd_to_check = sockfd;
                     if (tls_config.enabled && tls != NULL) {
                         if (esp_tls_get_conn_sockfd(tls, &fd_to_check) != ESP_OK) {
@@ -3046,14 +3474,19 @@ class NATS {
                     int ret = select(fd_to_check + 1, &rfds, NULL, NULL, &tv);
                     if (ret > 0 && FD_ISSET(fd_to_check, &rfds)) {
                         recv();
-                        // Check if we got the PONG
-                        xSemaphoreTakeRecursive(state_mutex, portMAX_DELAY);
-                        bool pong_received = (outstanding_pings <= initial_pongs);
-                        xSemaphoreGiveRecursive(state_mutex);
-                        if (pong_received) {
-                            return true;
-                        }
                     }
+                }
+                else {
+                    // No valid connection method, yield and continue
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+
+                // Check if we got the PONG
+                xSemaphoreTakeRecursive(state_mutex, portMAX_DELAY);
+                bool pong_received = (outstanding_pings <= initial_pongs);
+                xSemaphoreGiveRecursive(state_mutex);
+                if (pong_received) {
+                    return true;
                 }
 
                 if (!connected) {
@@ -3097,7 +3530,8 @@ class NATS {
             }
 
             // Handle async connect
-            if (connect_state == CONNECTING && async_connect_cb != NULL && sockfd < 0) {
+            bool has_connection = (transport != NULL && transport->is_connected()) || sockfd >= 0;
+            if (connect_state == CONNECTING && async_connect_cb != NULL && !has_connection) {
                 bool success = connect();
                 if (success) {
                     connect_state = CONNECTED;
@@ -3109,6 +3543,39 @@ class NATS {
                 return;
             }
 
+            // Transport-based processing
+            if (transport != NULL && transport->is_connected()) {
+                // Check for data using transport
+                if (transport->has_data_available(0)) {
+                    recv();
+                }
+
+                // Check for request timeouts
+                NATSUtil::Array<int> timed_out_sids;
+                NATSUtil::Array<timeout_cb> timeout_callbacks;
+
+                xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
+                for (size_t i = 0; i < subs.size(); i++) {
+                    if (subs[i] != NULL && subs[i]->timed_out()) {
+                        timed_out_sids.push_back(i);
+                        timeout_callbacks.push_back(subs[i]->on_timeout);
+                    }
+                }
+                xSemaphoreGiveRecursive(mutex);
+
+                for (size_t i = 0; i < timed_out_sids.size(); i++) {
+                    if (timeout_callbacks[i] != NULL) {
+                        timeout_callbacks[i]();
+                    }
+                    unsubscribe(timed_out_sids[i]);
+                }
+
+                if (ping_timer.process())
+                    ping();
+                return;
+            }
+
+            // Legacy socket-based processing
             if (sockfd >= 0) {
                 int fd_to_check = sockfd;
 
@@ -3153,7 +3620,8 @@ class NATS {
 
                 if (ping_timer.process())
                     ping();
-            } else {
+            } else if (transport == NULL) {
+                // Only handle reconnection in legacy mode (no transport)
                 disconnect();
                 // Protect reconnect_attempts read with mutex
                 if (state_mutex != NULL) xSemaphoreTakeRecursive(state_mutex, portMAX_DELAY);
