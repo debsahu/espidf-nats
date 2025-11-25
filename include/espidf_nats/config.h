@@ -3,7 +3,7 @@
 
 // NATS client identification
 #define NATS_CLIENT_LANG "espidf"
-#define NATS_CLIENT_VERSION "1.0.0"
+#define NATS_CLIENT_VERSION "1.0.2"
 
 // Configuration options (can be overridden before including)
 #ifndef NATS_CONF_VERBOSE
