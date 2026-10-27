@@ -26,7 +26,7 @@ cd "$CERTS_DIR"
 
 # 1. Generate CA private key
 echo "📝 Generating CA private key..."
-openssl genrsa -out ca-key.pem 4096
+openssl ecparam -name prime256v1 -genkey -noout -out ca-key.pem
 
 # 2. Generate CA certificate
 echo "📝 Generating CA certificate..."
@@ -35,7 +35,7 @@ openssl req -new -x509 -days $DAYS_VALID -key ca-key.pem -out ca-cert.pem \
 
 # 3. Generate server private key
 echo "📝 Generating server private key..."
-openssl genrsa -out server-key.pem 4096
+openssl ecparam -name prime256v1 -genkey -noout -out server-key.pem
 
 # 4. Generate server certificate signing request
 echo "📝 Generating server CSR..."
@@ -67,7 +67,7 @@ openssl x509 -req -days $DAYS_VALID -in server.csr \
 
 # 7. Generate client certificates for mutual TLS (mTLS) testing
 echo "📝 Generating client private key..."
-openssl genrsa -out client-key.pem 4096
+openssl ecparam -name prime256v1 -genkey -noout -out client-key.pem
 
 echo "📝 Generating client CSR..."
 openssl req -new -key client-key.pem -out client.csr \

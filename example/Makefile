@@ -7,7 +7,7 @@
 # Default target
 help:
 	@echo "╔════════════════════════════════════════════════════════════╗"
-	@echo "║       NATS Test Application - Make Commands               ║"
+	@echo "║       NATS Test Application - Make Commands                ║"
 	@echo "╚════════════════════════════════════════════════════════════╝"
 	@echo ""
 	@echo "Docker NATS Servers:"

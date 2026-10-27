@@ -50,7 +50,7 @@ services:
       - "/config/nats-tls.conf"
     volumes:
       - ./docker/certs:/certs:ro
-      - ./docker/nats-tls.conf:/config/nats-tls.conf:ro
+      - ./docker/config/nats-tls.conf:/config/nats-tls.conf:ro
       - nats-tls-data:/data
     networks:
       - nats-network

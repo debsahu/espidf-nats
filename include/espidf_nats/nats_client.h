@@ -2609,12 +2609,14 @@ class NATS {
         }
 
         void disconnect() {
-            if (!connected && (transport == NULL || !transport->is_connected())) return;
+            bool was_connected = connected;
+
             last_reconnect_attempt = NATSUtil::millis();
             connected = false;
             connect_state = DISCONNECTED;
             async_connect_cb = NULL;
 
+            // Set a generic error code if nothing else is flagged
             if (last_error_code == NATS_ERR_NONE) {
                 last_error_code = NATS_ERR_DISCONNECTED;
             }
@@ -2623,7 +2625,7 @@ class NATS {
             if (transport != NULL) {
                 transport->disconnect();
                 // Don't clean up legacy resources when using transport
-                if (on_disconnect != NULL) on_disconnect();
+                if (was_connected && on_disconnect != NULL) on_disconnect();
                 return;
             }
 
@@ -2647,7 +2649,7 @@ class NATS {
             // Subscriptions are preserved so they can be restored on reconnect.
             // Use shutdown() or the destructor to fully clean up subscriptions.
 
-            if (on_disconnect != NULL) on_disconnect();
+            if (was_connected && on_disconnect != NULL) on_disconnect();
         }
 
         // Fully close the connection and clean up all subscriptions
